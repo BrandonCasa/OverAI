@@ -22,6 +22,9 @@ from torchvision.io import write_jpeg
 from .config import ModelConfig
 
 
+_ENCODER_STALL_BUDGET_SECONDS = 2.0
+
+
 @dataclass(frozen=True, slots=True)
 class WindowMatch:
     process_name: str
@@ -254,7 +257,15 @@ class EpisodeRecorder:
         blue_dir = temporary_dir / "frames_b"
         red_dir.mkdir(parents=True)
         blue_dir.mkdir(parents=True)
-        encode_queue: queue.Queue[_EncodedFrame | None] = queue.Queue(maxsize=16)
+        # Keep capture cadence independent from ordinary filesystem/antivirus
+        # stalls. At 720p, two seconds is still bounded to about 110 MiB while
+        # covering much longer stalls than the old fixed 16-frame queue.
+        encoder_queue_capacity = max(
+            16, math.ceil(self.cfg.video_hz * _ENCODER_STALL_BUDGET_SECONDS)
+        )
+        encode_queue: queue.Queue[_EncodedFrame | None] = queue.Queue(
+            maxsize=encoder_queue_capacity
+        )
         encode_error: list[BaseException] = []
         encoder_timeout_seconds = 30.0
 
@@ -353,9 +364,11 @@ class EpisodeRecorder:
         fast_index = 0
         capture_timeout_ms = max(1, math.ceil(1000 / self.cfg.video_hz))
         failure: BaseException | None = None
+        termination_reason: str | None = None
         try:
             while maximum_ticks is None or fast_index < maximum_ticks:
                 if self.backend.emergency_stop_requested():
+                    termination_reason = "emergency_stop"
                     break
                 deadline = start + fast_index / self.cfg.fast_hz
                 remaining = deadline - time.perf_counter()
@@ -363,11 +376,14 @@ class EpisodeRecorder:
                     time.sleep(remaining)
                 now = time.perf_counter()
                 if not self.backend.target_active():
+                    termination_reason = "target_focus_lost"
                     break
                 held = self.backend.held_inputs()
                 if self.profile.pause_key in held:
+                    termination_reason = "pause_key"
                     break
                 if now - deadline > 2.0 / self.cfg.fast_hz:
+                    termination_reason = "timing_gap"
                     break
                 fast_timestamps.append(now - start)
                 fast_durations.append(max(now - previous_fast, 1.0 / self.cfg.fast_hz))
@@ -408,6 +424,8 @@ class EpisodeRecorder:
                 fast_index += 1
                 if encode_error:
                     raise RuntimeError("JPEG encoder failed") from encode_error[0]
+            if termination_reason is None:
+                termination_reason = "duration_complete"
         except BaseException as error:
             failure = error
         finally:
@@ -439,6 +457,8 @@ class EpisodeRecorder:
             "id": self.episode_id,
             "split": self.split,
             "profile_sha256": self.profile.sha256(),
+            "termination_reason": termination_reason,
+            "duration_seconds": float(fast_timestamps[-1]),
             "finalized": False,
         }
         (temporary_dir / "episode.json").write_text(
@@ -615,7 +635,14 @@ def record_main() -> None:
     recorder = EpisodeRecorder(
         backend, profile, cfg, args.output, args.split, args.episode_id
     )
-    print(recorder.record(args.duration))
+    episode = recorder.record(args.duration)
+    metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+    print(
+        "recording stopped: "
+        f"reason={metadata['termination_reason']} "
+        f"duration={metadata['duration_seconds']:.3f}s"
+    )
+    print(episode)
 
 
 def finalize_main() -> None:

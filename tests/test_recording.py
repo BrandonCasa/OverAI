@@ -171,6 +171,7 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(backend.stopped)
             self.assertEqual(backend.frame_timeouts, [2000])
             metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["termination_reason"], "pause_key")
             self.assertNotIn("telemetry", metadata)
             self.assertFalse(
                 {"health", "damage_events", "kill_events", "charge"} & controls.keys()
@@ -233,6 +234,37 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(controls["fast_timestamps"].shape[0], 12)
             self.assertEqual(controls["frame_timestamps"].shape[0], 6)
             self.assertEqual(backend.frame_timeouts, [2000, 34, 34, 34, 34, 34])
+
+    def test_transient_jpeg_stall_does_not_truncate_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _SyntheticBackend(cfg, pause_after_first=False)
+            write_calls = 0
+
+            def transient_stall(*_args, **_kwargs) -> None:
+                nonlocal write_calls
+                write_calls += 1
+                if write_calls == 1:
+                    time.sleep(0.8)
+
+            with patch("overai.recording.write_jpeg", side_effect=transient_stall):
+                episode = EpisodeRecorder(
+                    backend, profile, cfg, root, "train", "jpeg-stall"
+                ).record(duration_seconds=0.8)
+
+            controls = torch.load(episode / "controls.pt", weights_only=True)
+            metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(controls["fast_timestamps"].shape[0], 48)
+            self.assertEqual(controls["frame_timestamps"].shape[0], 24)
+            self.assertEqual(metadata["termination_reason"], "duration_complete")
 
     def test_jpeg_worker_failure_cannot_deadlock_recorder_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
