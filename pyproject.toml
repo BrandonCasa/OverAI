@@ -13,6 +13,7 @@ dependencies = [
     "safetensors",
     "torch",
     "torchvision",
+    "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
     "transformers",
 ]
 
