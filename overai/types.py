@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
-from typing import Optional, TypeVar
+from typing import TypeVar
 
 import torch
 
@@ -53,8 +53,8 @@ class FastControllerState:
 class ControllerState:
     memory: HierarchicalMemoryState
     fast: FastControllerState
-    current_grid: Optional[torch.Tensor]
-    shared_tokens: Optional[torch.Tensor]
+    current_grid: torch.Tensor | None
+    shared_tokens: torch.Tensor | None
     previous_axis_trajectory: torch.Tensor
     previous_slow_trajectory: torch.Tensor
 
@@ -76,7 +76,7 @@ class FastPrediction:
 
 @dataclass(slots=True)
 class ReplanOutput:
-    slow: Optional[SlowPrediction]
+    slow: SlowPrediction | None
     fast: FastPrediction
     state: ControllerState
 
@@ -90,8 +90,8 @@ class DecodedSlowAction:
 @dataclass(slots=True)
 class RuntimeStepOutput:
     axes: torch.Tensor
-    discrete: Optional[DecodedSlowAction]
-    slow_prediction: Optional[SlowPrediction]
+    discrete: DecodedSlowAction | None
+    slow_prediction: SlowPrediction | None
     fast_prediction: FastPrediction
     state: ControllerState
 

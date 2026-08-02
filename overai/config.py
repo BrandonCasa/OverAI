@@ -159,7 +159,7 @@ class ModelConfig:
     def from_json(cls, path: str | Path) -> ModelConfig:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            raise ValueError("model config must contain a JSON object")
+            raise TypeError("model config must contain a JSON object")
         return cls(**data)
 
     @classmethod

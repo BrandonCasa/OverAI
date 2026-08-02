@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from torchvision.io import write_jpeg
 
+from overai.config import ModelConfig
 from overai.recording import (
     AxisDenormalizer,
     AxisNormalization,
@@ -16,7 +17,6 @@ from overai.recording import (
     EpisodeRecorder,
     finalize_dataset,
 )
-from overai.config import ModelConfig
 
 
 class _SyntheticBackend:

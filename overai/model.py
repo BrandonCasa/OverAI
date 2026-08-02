@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Optional
 
 import torch
 from torch import nn
@@ -35,7 +34,9 @@ from .types import (
 
 def _fixed_2d_position(height: int, width: int, dim: int) -> torch.Tensor:
     if dim % 4:
-        raise ValueError("vision_dim must be divisible by four for 2D position encoding")
+        raise ValueError(
+            "vision_dim must be divisible by four for 2D position encoding"
+        )
     quarter = dim // 4
     frequencies = torch.exp(
         torch.arange(quarter, dtype=torch.float32)
@@ -102,7 +103,9 @@ class SpatialVisionEncoder(nn.Module):
             )
 
         if frame.dtype == torch.uint8:
-            frame = frame.to(dtype=self.patch_projection.weight.dtype).div_(127.5).sub_(1.0)
+            frame = (
+                frame.to(dtype=self.patch_projection.weight.dtype).div_(127.5).sub_(1.0)
+            )
         elif not torch.is_floating_point(frame):
             raise TypeError("frames must be uint8 or floating point")
         else:
@@ -410,9 +413,9 @@ class SlowControlDecoder(nn.Module):
         for layer in self.trajectory_decoder:
             trajectory = layer(trajectory, shared_tokens)
         return SlowPrediction(
-            immediate_movement_logits=self.immediate_movement_head(immediate_token).view(
-                batch, 2, 3
-            ),
+            immediate_movement_logits=self.immediate_movement_head(
+                immediate_token
+            ).view(batch, 2, 3),
             immediate_button_logits=self.immediate_button_head(immediate_token),
             trajectory_movement_logits=self.trajectory_movement_head(trajectory).view(
                 batch, self.trajectory_queries.shape[1], 2, 3
@@ -713,7 +716,7 @@ class RuntimeController:
 
     def step(
         self,
-        optional_new_frame: Optional[torch.Tensor],
+        optional_new_frame: torch.Tensor | None,
         observation_context: ObservationContext,
         executed_actions: ExecutedActions,
         timing: TimingContext,
