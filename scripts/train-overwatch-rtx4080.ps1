@@ -34,9 +34,9 @@ print(f"Training GPU ready: {name} ({properties.total_memory / 2**30:.1f} GiB)")
 
 Push-Location $repoRoot
 try {
-    & $trainer --manifest $trainManifest --model-config $modelConfig --history-seconds 10 --optimization-seconds 2 --stride-seconds 2 --validate-only
+    & $trainer --manifest $trainManifest --model-config $modelConfig --history-seconds 5 --optimization-seconds 2 --stride-seconds 2 --validate-only
     if ($LASTEXITCODE -ne 0) { throw "Training dataset validation failed." }
-    & $trainer --manifest $validationManifest --model-config $modelConfig --history-seconds 10 --optimization-seconds 2 --stride-seconds 2 --validate-only
+    & $trainer --manifest $validationManifest --model-config $modelConfig --history-seconds 5 --optimization-seconds 2 --stride-seconds 2 --validate-only
     if ($LASTEXITCODE -ne 0) { throw "Validation dataset validation failed." }
 
     if (-not $Train) {
@@ -50,7 +50,7 @@ try {
         "--output", $output,
         "--batch-size", "1",
         "--epochs", "$Epochs",
-        "--history-seconds", "10",
+        "--history-seconds", "5",
         "--optimization-seconds", "2",
         "--stride-seconds", "2",
         "--tbptt-seconds", "0.1",

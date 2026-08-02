@@ -166,7 +166,7 @@ and deployment.
 ## Local RTX 4080 training
 
 The RTX 4080 profile preserves the 1080p model shape. The Overwatch command uses
-10 seconds of causal warm-up while optimizing two seconds at a time so the
+5 seconds of causal warm-up while optimizing two seconds at a time so the
 current episode lengths contribute useful windows.
 Warm-up is excluded from the gradient tape; the hierarchical memory still
 conditions every optimized prediction. The optimization span is
@@ -196,7 +196,7 @@ uv run overai-train `
   --output runs/overwatch-4080 `
   --batch-size 1 `
   --epochs 20 `
-  --history-seconds 10 `
+  --history-seconds 5 `
   --optimization-seconds 2 `
   --stride-seconds 2 `
   --tbptt-seconds 0.1 `
