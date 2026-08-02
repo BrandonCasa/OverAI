@@ -10,7 +10,6 @@ import torch
 
 @dataclass(slots=True)
 class ExecutedActions:
-    horizontal: torch.Tensor
     movement: torch.Tensor
     buttons: torch.Tensor
     axes: torch.Tensor
@@ -62,10 +61,8 @@ class ControllerState:
 
 @dataclass(slots=True)
 class SlowPrediction:
-    immediate_horizontal_logits: torch.Tensor
     immediate_movement_logits: torch.Tensor
     immediate_button_logits: torch.Tensor
-    trajectory_horizontal_logits: torch.Tensor
     trajectory_movement_logits: torch.Tensor
     trajectory_button_logits: torch.Tensor
 
@@ -86,7 +83,6 @@ class ReplanOutput:
 
 @dataclass(slots=True)
 class DecodedSlowAction:
-    horizontal: torch.Tensor
     movement: torch.Tensor
     buttons: torch.Tensor
 
@@ -102,7 +98,6 @@ class RuntimeStepOutput:
 
 @dataclass(slots=True)
 class SlowTargets:
-    horizontal: torch.Tensor
     movement: torch.Tensor
     buttons: torch.Tensor
 

@@ -55,10 +55,9 @@ def main() -> None:
     zero = lambda width: torch.zeros(1, width, device=device)
     context = ObservationContext(zero(1), zero(1), zero(1), zero(1))
     actions = ExecutedActions(
-        torch.ones(1, dtype=torch.long, device=device),
-        torch.ones(1, dtype=torch.long, device=device),
-        zero(cfg.num_buttons),
-        zero(2),
+        movement=torch.ones(1, 2, dtype=torch.long, device=device),
+        buttons=zero(cfg.num_buttons),
+        axes=zero(2),
     )
     timing = TimingContext(zero(1), zero(1), zero(1), zero(1))
 

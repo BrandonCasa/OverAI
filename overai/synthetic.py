@@ -53,12 +53,13 @@ def create_synthetic_dataset(
         ),
         dim=-1,
     )
-    horizontal = torch.where(
+    movement_x = torch.where(
         torch.sin(slow_timestamps) > 0.25,
         2,
         torch.where(torch.sin(slow_timestamps) < -0.25, 0, 1),
     ).long()
-    movement = torch.where(torch.cos(slow_timestamps * 0.7) > 0, 2, 1).long()
+    movement_y = torch.where(torch.cos(slow_timestamps * 0.7) > 0, 2, 1).long()
+    movement = torch.stack((movement_x, movement_y), dim=-1)
     buttons = torch.stack(
         [
             ((torch.arange(slow_count) + button) % (button + 2) == 0)
@@ -70,23 +71,22 @@ def create_synthetic_dataset(
         "fast_timestamps": fast_timestamps,
         "frame_timestamps": frame_timestamps,
         "slow_timestamps": slow_timestamps,
-        "health": (1.0 - fast_timestamps[:, None] / max(seconds, 1.0)).clamp(-1, 1),
-        "damage_events": ((torch.arange(fast_count) % (cfg.fast_hz * 2)) == 0)
+        "health": (1.0 - slow_timestamps[:, None] / max(seconds, 1.0)).clamp(-1, 1),
+        "damage_events": ((torch.arange(slow_count) % (cfg.slow_hz * 2)) == 0)
         .float()
         .unsqueeze(-1),
-        "kill_events": ((torch.arange(fast_count) % (cfg.fast_hz * 3)) == 0)
+        "kill_events": ((torch.arange(slow_count) % (cfg.slow_hz * 3)) == 0)
         .float()
         .unsqueeze(-1),
-        "charge": torch.sin(fast_timestamps[:, None] * 0.3),
+        "charge": torch.sin(slow_timestamps[:, None] * 0.3),
         "axes": axes,
-        "horizontal": horizontal,
         "movement": movement,
         "buttons": buttons,
     }
     controls_path = episode_dir / "controls.pt"
     torch.save(controls, controls_path)
     manifest = {
-        "version": 1,
+        "version": 2,
         "episodes": [
             {
                 "id": "synthetic-001",

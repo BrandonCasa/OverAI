@@ -32,8 +32,7 @@ class ControllerTests(unittest.TestCase):
             charge=torch.zeros(1, 1),
         )
         self.actions = ExecutedActions(
-            horizontal=torch.ones(1, dtype=torch.long),
-            movement=torch.ones(1, dtype=torch.long),
+            movement=torch.ones(1, 2, dtype=torch.long),
             buttons=torch.zeros(1, self.cfg.num_buttons),
             axes=torch.zeros(1, 2),
         )
@@ -66,6 +65,11 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertIsNotNone(output.slow)
         assert output.slow is not None
+        self.assertEqual(tuple(output.slow.immediate_movement_logits.shape), (1, 2, 3))
+        self.assertEqual(
+            tuple(output.slow.trajectory_movement_logits.shape),
+            (1, self.cfg.slow_horizon, 2, 3),
+        )
         self.assertEqual(
             tuple(output.slow.trajectory_button_logits.shape),
             (1, self.cfg.slow_horizon, self.cfg.num_buttons),
@@ -78,8 +82,9 @@ class ControllerTests(unittest.TestCase):
         slow_losses = slow_control_loss(
             output.slow,
             SlowTargets(
-                horizontal=torch.ones(1, self.cfg.slow_horizon, dtype=torch.long),
-                movement=torch.ones(1, self.cfg.slow_horizon, dtype=torch.long),
+                movement=torch.ones(
+                    1, self.cfg.slow_horizon, 2, dtype=torch.long
+                ),
                 buttons=torch.zeros(1, self.cfg.slow_horizon, self.cfg.num_buttons),
             ),
             self.cfg,

@@ -111,18 +111,16 @@ class ObservationContextEncoder(nn.Module):
 class ExecutedActionEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        self.horizontal_embedding = nn.Embedding(3, 32)
         self.movement_embedding = nn.Embedding(3, 32)
         self.buttons_encoder = MLP(cfg.num_buttons, 64, 64, dropout=cfg.dropout)
         self.axes_encoder = MLP(2, 64, 64, dropout=cfg.dropout)
         self.output = MLP(192, cfg.action_dim * 2, cfg.action_dim, dropout=cfg.dropout)
 
     def forward(self, actions: ExecutedActions) -> torch.Tensor:
-        horizontal = self.horizontal_embedding(actions.horizontal.long())
-        movement = self.movement_embedding(actions.movement.long())
+        movement = self.movement_embedding(actions.movement.long()).flatten(-2)
         buttons = self.buttons_encoder(actions.buttons.float())
         axes = self.axes_encoder(actions.axes.float())
-        return self.output(torch.cat((horizontal, movement, buttons, axes), dim=-1))
+        return self.output(torch.cat((movement, buttons, axes), dim=-1))
 
 
 class PreviousTrajectoryEncoder(nn.Module):
@@ -360,8 +358,7 @@ class SlowControlDecoder(nn.Module):
         self.immediate_attention = CrossAttentionBlock(
             cfg.model_dim, cfg.num_heads, cfg.dropout
         )
-        self.immediate_horizontal_head = nn.Linear(cfg.model_dim, 3)
-        self.immediate_movement_head = nn.Linear(cfg.model_dim, 3)
+        self.immediate_movement_head = nn.Linear(cfg.model_dim, 6)
         self.immediate_button_head = nn.Linear(cfg.model_dim, cfg.num_buttons)
         self.trajectory_queries = nn.Parameter(
             torch.randn(1, cfg.slow_horizon, cfg.model_dim) * 0.02
@@ -370,8 +367,7 @@ class SlowControlDecoder(nn.Module):
             CrossAttentionBlock(cfg.model_dim, cfg.num_heads, cfg.dropout)
             for _ in range(cfg.decoder_layers)
         )
-        self.trajectory_horizontal_head = nn.Linear(cfg.model_dim, 3)
-        self.trajectory_movement_head = nn.Linear(cfg.model_dim, 3)
+        self.trajectory_movement_head = nn.Linear(cfg.model_dim, 6)
         self.trajectory_button_head = nn.Linear(cfg.model_dim, cfg.num_buttons)
 
     def forward(self, shared_tokens: torch.Tensor) -> SlowPrediction:
@@ -383,11 +379,13 @@ class SlowControlDecoder(nn.Module):
         for layer in self.trajectory_decoder:
             trajectory = layer(trajectory, shared_tokens)
         return SlowPrediction(
-            immediate_horizontal_logits=self.immediate_horizontal_head(immediate_token),
-            immediate_movement_logits=self.immediate_movement_head(immediate_token),
+            immediate_movement_logits=self.immediate_movement_head(immediate_token).view(
+                batch, 2, 3
+            ),
             immediate_button_logits=self.immediate_button_head(immediate_token),
-            trajectory_horizontal_logits=self.trajectory_horizontal_head(trajectory),
-            trajectory_movement_logits=self.trajectory_movement_head(trajectory),
+            trajectory_movement_logits=self.trajectory_movement_head(trajectory).view(
+                batch, self.trajectory_queries.shape[1], 2, 3
+            ),
             trajectory_button_logits=self.trajectory_button_head(trajectory),
         )
 
@@ -580,8 +578,7 @@ class HierarchicalImitationController(nn.Module):
     def _slow_trajectory(prediction: SlowPrediction) -> torch.Tensor:
         return torch.cat(
             (
-                prediction.trajectory_horizontal_logits,
-                prediction.trajectory_movement_logits,
+                prediction.trajectory_movement_logits.flatten(-2),
                 prediction.trajectory_button_logits,
             ),
             dim=-1,
@@ -660,7 +657,6 @@ class HierarchicalImitationController(nn.Module):
 
 def decode_slow_action(prediction: SlowPrediction) -> DecodedSlowAction:
     return DecodedSlowAction(
-        horizontal=prediction.immediate_horizontal_logits.argmax(dim=-1),
         movement=prediction.immediate_movement_logits.argmax(dim=-1),
         buttons=torch.sigmoid(prediction.immediate_button_logits) >= 0.5,
     )

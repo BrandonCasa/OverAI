@@ -26,7 +26,7 @@ class GameAdapter(ABC):
 
     @abstractmethod
     def observation(self) -> ObservationContext:
-        """Return health, damage, kill, and charge tensors of shape [1]."""
+        """Return 5 Hz health, damage, kill, and charge tensors of shape [1]."""
 
     @abstractmethod
     def executed_actions(self) -> ExecutedActions:
@@ -38,7 +38,7 @@ class GameAdapter(ABC):
 
     @abstractmethod
     def apply_discrete(self, action: DecodedSlowAction) -> None:
-        """Apply CPU scalar categories and a [num_buttons] button tensor."""
+        """Apply CPU [x, y] categories and a [num_buttons] button tensor."""
 
     def close(self) -> None:
         """Release adapter resources."""
@@ -57,8 +57,7 @@ def _batch_context(
 
 def _batch_actions(actions: ExecutedActions, device: torch.device) -> ExecutedActions:
     return ExecutedActions(
-        horizontal=actions.horizontal.reshape(1).to(device),
-        movement=actions.movement.reshape(1).to(device),
+        movement=actions.movement.reshape(1, 2).to(device),
         buttons=actions.buttons.reshape(1, -1).to(device),
         axes=actions.axes.reshape(1, 2).to(device),
     )
@@ -69,7 +68,7 @@ def load_controller_checkpoint(
     device: torch.device | str = "cuda",
 ) -> HierarchicalImitationController:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if payload.get("format_version") != 1:
+    if payload.get("format_version") != 2:
         raise ValueError("unsupported checkpoint format")
     cfg = ModelConfig(**payload["model_config"])
     model = HierarchicalImitationController(cfg)
@@ -97,6 +96,7 @@ def run_realtime(
     last_frame_time = start
     last_slow_time = start
     previous_tick_time = start
+    context: ObservationContext | None = None
 
     try:
         while (
@@ -120,6 +120,7 @@ def run_realtime(
                 last_frame_time = now
             if slow_due:
                 last_slow_time = now
+                context = _batch_context(adapter.observation(), device)
 
             timing = TimingContext(
                 absolute_time=torch.tensor([[now - start]], device=device),
@@ -131,7 +132,8 @@ def run_realtime(
                     [[now - previous_tick_time]], device=device
                 ),
             )
-            context = _batch_context(adapter.observation(), device)
+            if context is None:
+                raise RuntimeError("observation context was not initialized")
             actions = _batch_actions(adapter.executed_actions(), device)
             autocast_enabled = use_bf16 and device.type == "cuda"
             with (
@@ -148,7 +150,6 @@ def run_realtime(
             if output.discrete is not None:
                 adapter.apply_discrete(
                     DecodedSlowAction(
-                        horizontal=output.discrete.horizontal[0].cpu(),
                         movement=output.discrete.movement[0].cpu(),
                         buttons=output.discrete.buttons[0].cpu(),
                     )

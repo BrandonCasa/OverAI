@@ -31,7 +31,6 @@ CONTROL_KEYS = (
     "kill_events",
     "charge",
     "axes",
-    "horizontal",
     "movement",
     "buttons",
 )
@@ -58,11 +57,9 @@ class SequenceBatch:
     kill_events: torch.Tensor
     charge: torch.Tensor
     axes: torch.Tensor
-    horizontal: torch.Tensor
     movement: torch.Tensor
     buttons: torch.Tensor
     initial_axes: torch.Tensor
-    initial_horizontal: torch.Tensor
     initial_movement: torch.Tensor
     initial_buttons: torch.Tensor
     history_ticks: int
@@ -97,11 +94,12 @@ class SequenceBatch:
     def observation_context(
         self, tick: int, device: torch.device
     ) -> ObservationContext:
+        slow_tick = tick // self.fast_ticks_per_slow
         return ObservationContext(
-            health=self.health[:, tick].to(device, non_blocking=True),
-            damage_event=self.damage_events[:, tick].to(device, non_blocking=True),
-            kill_event=self.kill_events[:, tick].to(device, non_blocking=True),
-            charge=self.charge[:, tick].to(device, non_blocking=True),
+            health=self.health[:, slow_tick].to(device, non_blocking=True),
+            damage_event=self.damage_events[:, slow_tick].to(device, non_blocking=True),
+            kill_event=self.kill_events[:, slow_tick].to(device, non_blocking=True),
+            charge=self.charge[:, slow_tick].to(device, non_blocking=True),
         )
 
     def executed_actions(self, tick: int, device: torch.device) -> ExecutedActions:
@@ -109,15 +107,12 @@ class SequenceBatch:
         current_slow = tick // self.fast_ticks_per_slow
         axes = self.initial_axes if tick == 0 else self.axes[:, previous_fast]
         if current_slow == 0:
-            horizontal = self.initial_horizontal
             movement = self.initial_movement
             buttons = self.initial_buttons
         else:
-            horizontal = self.horizontal[:, current_slow - 1]
             movement = self.movement[:, current_slow - 1]
             buttons = self.buttons[:, current_slow - 1]
         return ExecutedActions(
-            horizontal=horizontal.to(device, non_blocking=True),
             movement=movement.to(device, non_blocking=True),
             buttons=buttons.to(device, non_blocking=True),
             axes=axes.to(device, non_blocking=True),
@@ -147,7 +142,7 @@ class SequenceBatch:
 def _load_controls(path: Path) -> dict[str, torch.Tensor]:
     loaded = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(loaded, dict):
-        raise ValueError(f"{path} must contain a tensor dictionary")
+        raise TypeError(f"{path} must contain a tensor dictionary")
     missing = [key for key in CONTROL_KEYS if key not in loaded]
     if missing:
         raise ValueError(f"{path} is missing controls: {', '.join(missing)}")
@@ -155,7 +150,7 @@ def _load_controls(path: Path) -> dict[str, torch.Tensor]:
     for key in CONTROL_KEYS:
         value = loaded[key]
         if not isinstance(value, torch.Tensor):
-            raise ValueError(f"{path}: {key} must be a tensor")
+            raise TypeError(f"{path}: {key} must be a tensor")
         controls[key] = value.contiguous()
     return controls
 
@@ -167,19 +162,18 @@ def _validate_controls(
     cfg: ModelConfig,
 ) -> tuple[int, int]:
     fast_count = controls["axes"].shape[0]
-    slow_count = controls["horizontal"].shape[0]
+    slow_count = controls["movement"].shape[0]
     expected_fast_shapes = {
         "fast_timestamps": (fast_count,),
-        "health": (fast_count, 1),
-        "damage_events": (fast_count, 1),
-        "kill_events": (fast_count, 1),
-        "charge": (fast_count, 1),
         "axes": (fast_count, 2),
     }
     expected_slow_shapes = {
         "slow_timestamps": (slow_count,),
-        "horizontal": (slow_count,),
-        "movement": (slow_count,),
+        "health": (slow_count, 1),
+        "damage_events": (slow_count, 1),
+        "kill_events": (slow_count, 1),
+        "charge": (slow_count, 1),
+        "movement": (slow_count, 2),
         "buttons": (slow_count, cfg.num_buttons),
     }
     expected_frame_shapes = {"frame_timestamps": (frame_count,)}
@@ -209,10 +203,9 @@ def _validate_controls(
         values = controls[key].float()
         if values.numel() > 1 and not torch.all(values[1:] > values[:-1]):
             raise ValueError(f"{path}: {key} must be strictly increasing")
-    for key in ("horizontal", "movement"):
-        values = controls[key]
-        if values.dtype.is_floating_point or values.min() < 0 or values.max() > 2:
-            raise ValueError(f"{path}: {key} must contain integer classes 0, 1, or 2")
+    movement = controls["movement"]
+    if movement.dtype.is_floating_point or movement.min() < 0 or movement.max() > 2:
+        raise ValueError(f"{path}: movement must contain integer classes 0, 1, or 2")
     if not torch.isfinite(controls["axes"]).all():
         raise ValueError(f"{path}: axes contains non-finite values")
     if controls["axes"].abs().max() > 1.0001:
@@ -226,19 +219,25 @@ def _validate_controls(
 def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
     manifest_path = Path(path).resolve()
     data: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("dataset manifest must be an object with version 1")
+    if not isinstance(data, dict):
+        raise TypeError("dataset manifest must be an object")
+    if data.get("version") != 2:
+        raise ValueError("dataset manifest must have version 2")
     episodes = data.get("episodes")
-    if not isinstance(episodes, list) or not episodes:
+    if not isinstance(episodes, list):
+        raise TypeError("dataset manifest episodes must be a list")
+    if not episodes:
         raise ValueError("dataset manifest must contain at least one episode")
 
     records: list[EpisodeRecord] = []
     seen_ids: set[str] = set()
     for item in episodes:
         if not isinstance(item, dict):
-            raise ValueError("each manifest episode must be an object")
+            raise TypeError("each manifest episode must be an object")
         episode_id = item.get("id")
-        if not isinstance(episode_id, str) or not episode_id or episode_id in seen_ids:
+        if not isinstance(episode_id, str):
+            raise TypeError("episode ids must be strings")
+        if not episode_id or episode_id in seen_ids:
             raise ValueError("episode ids must be non-empty and unique")
         seen_ids.add(episode_id)
         frame_dir = (manifest_path.parent / str(item.get("frames", ""))).resolve()
@@ -339,16 +338,14 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             "fast_timestamps": controls["fast_timestamps"][base_tick:fast_end],
             "frame_timestamps": controls["frame_timestamps"][base_frame:frame_end],
             "slow_timestamps": controls["slow_timestamps"][base_slow:slow_end],
-            "health": controls["health"][base_tick:fast_end],
-            "damage_events": controls["damage_events"][base_tick:fast_end],
-            "kill_events": controls["kill_events"][base_tick:fast_end],
-            "charge": controls["charge"][base_tick:fast_end],
+            "health": controls["health"][base_slow:slow_end],
+            "damage_events": controls["damage_events"][base_slow:slow_end],
+            "kill_events": controls["kill_events"][base_slow:slow_end],
+            "charge": controls["charge"][base_slow:slow_end],
             "axes": controls["axes"][base_tick:fast_end],
-            "horizontal": controls["horizontal"][base_slow:slow_end],
             "movement": controls["movement"][base_slow:slow_end],
             "buttons": controls["buttons"][base_slow:slow_end],
             "initial_axes": controls["axes"][max(base_tick - 1, 0)],
-            "initial_horizontal": controls["horizontal"][max(base_slow - 1, 0)],
             "initial_movement": controls["movement"][max(base_slow - 1, 0)],
             "initial_buttons": controls["buttons"][max(base_slow - 1, 0)],
         }
@@ -370,11 +367,9 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             kill_events=stack("kill_events"),
             charge=stack("charge"),
             axes=stack("axes"),
-            horizontal=stack("horizontal"),
             movement=stack("movement"),
             buttons=stack("buttons"),
             initial_axes=stack("initial_axes"),
-            initial_horizontal=stack("initial_horizontal"),
             initial_movement=stack("initial_movement"),
             initial_buttons=stack("initial_buttons"),
             history_ticks=self.history_ticks,

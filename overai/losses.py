@@ -13,7 +13,6 @@ from .types import FastPrediction, FastTargets, SlowPrediction, SlowTargets
 
 @dataclass(frozen=True, slots=True)
 class LossWeights:
-    slow_horizontal: float = 1.0
     slow_movement: float = 1.0
     slow_buttons: float = 1.0
     fast_axis1: float = 1.0
@@ -48,27 +47,19 @@ def slow_control_loss(
     targets: SlowTargets,
     cfg: ModelConfig,
 ) -> dict[str, torch.Tensor]:
-    if targets.horizontal.shape[1] != cfg.slow_horizon:
+    if targets.movement.shape[1:] != (cfg.slow_horizon, 2):
         raise ValueError("slow target horizon does not match model config")
     weights = horizon_weights(
         cfg.slow_horizon,
-        prediction.trajectory_horizontal_logits.device,
-        prediction.trajectory_horizontal_logits.dtype,
-    )
-    horizontal_loss = weighted_mean(
-        F.cross_entropy(
-            prediction.trajectory_horizontal_logits.transpose(1, 2),
-            targets.horizontal.long(),
-            reduction="none",
-        ),
-        weights,
+        prediction.trajectory_movement_logits.device,
+        prediction.trajectory_movement_logits.dtype,
     )
     movement_loss = weighted_mean(
         F.cross_entropy(
-            prediction.trajectory_movement_logits.transpose(1, 2),
+            prediction.trajectory_movement_logits.permute(0, 3, 1, 2),
             targets.movement.long(),
             reduction="none",
-        ),
+        ).sum(dim=-1),
         weights,
     )
     button_loss = weighted_mean(
@@ -81,11 +72,10 @@ def slow_control_loss(
     )
 
     immediate_supervision = (
-        F.cross_entropy(
-            prediction.immediate_horizontal_logits, targets.horizontal[:, 0].long()
-        )
-        + F.cross_entropy(
-            prediction.immediate_movement_logits, targets.movement[:, 0].long()
+        2.0
+        * F.cross_entropy(
+            prediction.immediate_movement_logits.transpose(1, 2),
+            targets.movement[:, 0].long(),
         )
         + F.binary_cross_entropy_with_logits(
             prediction.immediate_button_logits, targets.buttons[:, 0].float()
@@ -93,11 +83,6 @@ def slow_control_loss(
     )
     immediate_consistency = (
         F.kl_div(
-            F.log_softmax(prediction.immediate_horizontal_logits, dim=-1),
-            F.softmax(prediction.trajectory_horizontal_logits[:, 0].detach(), dim=-1),
-            reduction="batchmean",
-        )
-        + F.kl_div(
             F.log_softmax(prediction.immediate_movement_logits, dim=-1),
             F.softmax(prediction.trajectory_movement_logits[:, 0].detach(), dim=-1),
             reduction="batchmean",
@@ -108,7 +93,6 @@ def slow_control_loss(
         )
     )
     return {
-        "slow_horizontal": horizontal_loss,
         "slow_movement": movement_loss,
         "slow_buttons": button_loss,
         "slow_immediate_supervision": immediate_supervision,
@@ -180,8 +164,7 @@ def total_imitation_loss(
     slow_losses = slow_control_loss(slow_prediction, slow_targets, cfg)
     fast_losses = fast_axis_loss(fast_prediction, fast_targets, cfg)
     total = (
-        weights.slow_horizontal * slow_losses["slow_horizontal"]
-        + weights.slow_movement * slow_losses["slow_movement"]
+        weights.slow_movement * slow_losses["slow_movement"]
         + weights.slow_buttons * slow_losses["slow_buttons"]
         + weights.fast_axis1 * fast_losses["fast_axis1"]
         + weights.fast_axis2 * fast_losses["fast_axis2"]
@@ -218,8 +201,7 @@ def weighted_slow_total(
     losses: dict[str, torch.Tensor], weights: LossWeights
 ) -> torch.Tensor:
     return (
-        weights.slow_horizontal * losses["slow_horizontal"]
-        + weights.slow_movement * losses["slow_movement"]
+        weights.slow_movement * losses["slow_movement"]
         + weights.slow_buttons * losses["slow_buttons"]
         + weights.immediate_supervision * losses["slow_immediate_supervision"]
         + weights.immediate_consistency * losses["slow_immediate_consistency"]

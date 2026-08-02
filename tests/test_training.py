@@ -28,6 +28,19 @@ class TrainingPipelineTests(unittest.TestCase):
             )
             batch = dataset.collate([dataset[0]])
             self.assertEqual(batch.process_ticks, cfg.fast_hz)
+            self.assertEqual(batch.movement.shape[-1], 2)
+            self.assertEqual(
+                batch.health.shape[1], cfg.slow_hz + cfg.slow_horizon - 1
+            )
+            first_context = batch.observation_context(0, torch.device("cpu"))
+            held_context = batch.observation_context(
+                cfg.fast_ticks_per_slow - 1, torch.device("cpu")
+            )
+            self.assertTrue(torch.equal(first_context.health, held_context.health))
+            next_context = batch.observation_context(
+                cfg.fast_ticks_per_slow, torch.device("cpu")
+            )
+            self.assertFalse(torch.equal(first_context.health, next_context.health))
             self.assertEqual(
                 tuple(batch.load_frame(0, torch.device("cpu")).shape),
                 (1, 3, cfg.image_height, cfg.image_width),

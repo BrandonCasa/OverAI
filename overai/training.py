@@ -176,9 +176,6 @@ def train_sequence_batch(
             if slow_prediction is not None:
                 slow_index = tick // cfg.fast_ticks_per_slow
                 slow_targets = SlowTargets(
-                    horizontal=batch.horizontal[
-                        :, slow_index : slow_index + cfg.slow_horizon
-                    ].to(device, non_blocking=True),
                     movement=batch.movement[
                         :, slow_index : slow_index + cfg.slow_horizon
                     ].to(device, non_blocking=True),
@@ -238,7 +235,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format_version": 1,
+            "format_version": 2,
             "model_config": model.cfg.to_dict(),
             "training_config": asdict(training_cfg),
             "model": model.state_dict(),
@@ -259,7 +256,7 @@ def load_checkpoint(
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
     )
-    if checkpoint_data.get("format_version") != 1:
+    if checkpoint_data.get("format_version") != 2:
         raise ValueError("unsupported checkpoint format")
     if checkpoint_data.get("model_config") != model.cfg.to_dict():
         raise ValueError("checkpoint model configuration does not match")

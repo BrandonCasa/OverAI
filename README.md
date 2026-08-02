@@ -10,10 +10,10 @@ The default model is the uploaded specification:
 - 1920×1080 RGB input split into 40×40 patches, preserving a 48×27 grid
 - shifted 9×8 local-window vision attention instead of quadratic global attention
 - causal memory covering roughly 30 seconds at recent, intermediate, and long rates
-- discrete horizontal, movement, and six-button state control at 5 Hz
+- two-dimensional discrete movement and six-button state control at 5 Hz
 - two bounded continuous axes at 60 Hz
 - parallel 2-second trajectories (10 discrete states and 120 axis samples)
-- 112,269,916 trainable parameters
+- 112,269,820 trainable parameters
 
 ## What is implemented
 
@@ -65,7 +65,7 @@ can be split by whole episode (never by overlapping windows):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "episodes": [
     {
       "id": "doom-e1m1-run-001",
@@ -84,19 +84,19 @@ Frame files are zero-padded JPEG or PNG images sampled at exactly 30 Hz. The
 | `fast_timestamps` | `[T_fast]` | 60 Hz | Monotonic seconds |
 | `frame_timestamps` | `[T_video]` | 30 Hz | Frame capture time |
 | `slow_timestamps` | `[T_slow]` | 5 Hz | Discrete-control time |
-| `health` | `[T_fast, 1]` | 60 Hz | Normalized context |
-| `damage_events` | `[T_fast, 1]` | 60 Hz | Binary event |
-| `kill_events` | `[T_fast, 1]` | 60 Hz | Binary event |
-| `charge` | `[T_fast, 1]` | 60 Hz | Normalized context |
+| `health` | `[T_slow, 1]` | 5 Hz | Normalized context |
+| `damage_events` | `[T_slow, 1]` | 5 Hz | Binary event |
+| `kill_events` | `[T_slow, 1]` | 5 Hz | Binary event |
+| `charge` | `[T_slow, 1]` | 5 Hz | Normalized context |
 | `axes` | `[T_fast, 2]` | 60 Hz | Executed values in `[-1, 1]` |
-| `horizontal` | `[T_slow]` | 5 Hz | `LEFT=0, NONE=1, RIGHT=2` |
-| `movement` | `[T_slow]` | 5 Hz | `REVERSE=0, NONE=1, FORWARD=2` |
+| `movement` | `[T_slow, 2]` | 5 Hz | X: `LEFT=0, NONE=1, RIGHT=2`; Y: `REVERSE=0, NONE=1, FORWARD=2` |
 | `buttons` | `[T_slow, 6]` | 5 Hz | Binary held states |
 
 If a game cannot expose health, damage, kills, or charge, record zeros for that
-channel and also return zeros from the deployment adapter. Do not infer future
-telemetry into an earlier timestamp. Record executed inputs, not merely requested
-inputs, so the action-history encoder sees what the game actually received.
+channel and also return zeros from the deployment adapter. Context is sampled at
+5 Hz and held across the intervening fast ticks. Do not infer future telemetry
+into an earlier timestamp. Record executed inputs, not merely requested inputs,
+so the action-history encoder sees what the game actually received.
 
 Before committing to a long H100 run:
 
@@ -152,7 +152,7 @@ Subclass `GameAdapter` with five operations:
 2. expose the four causal context values;
 3. report the previously executed controls;
 4. apply two continuous axes;
-5. apply discrete categories and held button states.
+5. apply a two-component discrete movement vector and held button states.
 
 Load and run a checkpoint with:
 
