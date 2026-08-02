@@ -20,7 +20,7 @@
   "num_heads": 8,
   "window_height": 9,
   "window_width": 8,
-  "dropout": 0.0,
+  "dropout": 0.1,
   "gradient_checkpointing": true,
   "frame_summary_tokens": 8,
   "recent_entries": 60,
