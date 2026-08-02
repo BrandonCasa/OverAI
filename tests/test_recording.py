@@ -539,6 +539,57 @@ class RecordingTests(unittest.TestCase):
                 replace(ModelConfig.tiny(), num_buttons=11),
             )
             self.assertEqual(len(records), 1)
+            repeated = finalize_dataset(root / "train", root / "validation")
+            self.assertEqual(repeated, normalization)
+
+            incremental_episode = root / "train" / "episodes" / "train-2"
+            (incremental_episode / "frames_r").mkdir(parents=True)
+            (incremental_episode / "frames_b").mkdir()
+            write_jpeg(
+                torch.zeros(1, 4, 4, dtype=torch.uint8),
+                str(incremental_episode / "frames_r" / "000000.jpg"),
+            )
+            write_jpeg(
+                torch.zeros(1, 4, 4, dtype=torch.uint8),
+                str(incremental_episode / "frames_b" / "000000.jpg"),
+            )
+            torch.save(
+                {
+                    "fast_timestamps": torch.tensor([0.0, 0.1], dtype=torch.float64),
+                    "frame_timestamps": torch.tensor([0.0], dtype=torch.float64),
+                    "slow_timestamps": torch.tensor([0.0], dtype=torch.float64),
+                    "raw_mouse_deltas": torch.tensor(
+                        [[100, 0], [200, 100]], dtype=torch.int32
+                    ),
+                    "fast_durations": torch.tensor([0.1, 0.1]),
+                    "axes": torch.zeros(2, 2),
+                    "movement": torch.ones(1, 2, dtype=torch.long),
+                    "buttons": torch.zeros(1, 11, dtype=torch.uint8),
+                },
+                incremental_episode / "controls.pt",
+            )
+            (incremental_episode / "episode.json").write_text(
+                json.dumps(
+                    {
+                        "id": "train-2",
+                        "split": "train",
+                        "profile_sha256": profile.sha256(),
+                        "finalized": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            incremental = finalize_dataset(root / "train", root / "validation")
+            self.assertEqual(incremental, normalization)
+            incremental_controls = torch.load(
+                incremental_episode / "controls.pt", weights_only=True
+            )
+            self.assertEqual(set(incremental_controls), set(CONTROL_KEYS))
+            self.assertEqual(float(incremental_controls["axes"].abs().max()), 1.0)
+            train_manifest = json.loads(
+                (root / "train" / "train.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(train_manifest["episodes"]), 2)
 
 
 if __name__ == "__main__":

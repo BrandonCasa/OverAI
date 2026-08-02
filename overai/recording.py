@@ -26,6 +26,7 @@ from .data import CONTROL_KEYS
 _ENCODER_STALL_BUDGET_SECONDS = 2.0
 _CAPTURE_REUSE_BUDGET_SECONDS = 0.25
 _TIMING_GAP_BUDGET_SECONDS = 0.25
+_RECORDED_CONTROL_KEYS = {*CONTROL_KEYS, "raw_mouse_deltas", "fast_durations"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +140,25 @@ class AxisNormalization:
             )
             scales.append(max(scale, 1.0))
         return cls((scales[0], scales[1]))
+
+    @classmethod
+    def from_manifest(cls, payload: Any) -> AxisNormalization:
+        if not isinstance(payload, dict):
+            raise TypeError("axis_normalization must be an object")
+        method = payload.get("method")
+        percentile = payload.get("percentile")
+        scales = payload.get("scale_counts_per_second")
+        if method != "clipped_linear_velocity_p99_5":
+            raise ValueError(f"unsupported axis normalization method: {method!r}")
+        if not isinstance(percentile, (int, float)) or float(percentile) != 99.5:
+            raise ValueError("axis normalization percentile must be 99.5")
+        if (
+            not isinstance(scales, list)
+            or len(scales) != 2
+            or any(not isinstance(value, (int, float)) or value <= 0 for value in scales)
+        ):
+            raise ValueError("axis normalization scales must contain two positive numbers")
+        return cls((float(scales[0]), float(scales[1])), float(percentile), method)
 
     def normalize(
         self, raw_mouse_deltas: torch.Tensor, fast_durations: torch.Tensor
@@ -527,7 +547,7 @@ def _episode_entry(root: Path, episode_dir: Path) -> dict[str, str]:
 
 def _validate_episode(
     episode: Path, expected_num_buttons: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Validate one closed segment before it can enter a manifest."""
 
     if episode.name.endswith(".recording"):
@@ -539,26 +559,22 @@ def _validate_episode(
     controls = torch.load(
         episode / "controls.pt", map_location="cpu", weights_only=True
     )
-    required = {
-        "fast_timestamps",
-        "frame_timestamps",
-        "slow_timestamps",
-        "raw_mouse_deltas",
-        "fast_durations",
-        "axes",
-        "movement",
-        "buttons",
-    }
-    if set(controls) != required:
+    control_keys = set(controls)
+    is_recorded = control_keys == _RECORDED_CONTROL_KEYS
+    is_finalized = control_keys == set(CONTROL_KEYS)
+    if not is_recorded and not is_finalized:
         raise ValueError(f"{episode}: controls keys do not match dataset format 3")
     fast_count = int(controls["fast_timestamps"].shape[0])
     slow_count = int(controls["slow_timestamps"].shape[0])
     if fast_count <= 0 or len(red) != int(controls["frame_timestamps"].shape[0]):
         raise ValueError(f"{episode}: frame/control counts are inconsistent")
-    if controls["raw_mouse_deltas"].shape != (fast_count, 2):
-        raise ValueError(f"{episode}: raw mouse deltas must have shape [T_fast, 2]")
-    if controls["fast_durations"].shape != (fast_count,):
-        raise ValueError(f"{episode}: fast durations must have shape [T_fast]")
+    if controls["axes"].shape != (fast_count, 2):
+        raise ValueError(f"{episode}: axes must have shape [T_fast, 2]")
+    if is_recorded:
+        if controls["raw_mouse_deltas"].shape != (fast_count, 2):
+            raise ValueError(f"{episode}: raw mouse deltas must have shape [T_fast, 2]")
+        if controls["fast_durations"].shape != (fast_count,):
+            raise ValueError(f"{episode}: fast durations must have shape [T_fast]")
     if controls["movement"].shape != (slow_count, 2):
         raise ValueError(f"{episode}: movement must have shape [T_slow, 2]")
     buttons = controls["buttons"]
@@ -575,23 +591,44 @@ def _validate_episode(
             values.numel() > 1 and not torch.all(values[1:] > values[:-1])
         ):
             raise ValueError(f"{episode}: {name} must be finite and strictly monotonic")
-    if not torch.isfinite(controls["fast_durations"]).all() or not torch.all(
-        controls["fast_durations"] > 0
+    if not torch.isfinite(controls["axes"]).all():
+        raise ValueError(f"{episode}: axes must be finite")
+    if is_finalized and controls["axes"].abs().max() > 1.0001:
+        raise ValueError(f"{episode}: finalized axes must be normalized to [-1, 1]")
+    if is_recorded and (
+        not torch.isfinite(controls["fast_durations"]).all()
+        or not torch.all(controls["fast_durations"] > 0)
     ):
         raise ValueError(f"{episode}: fast durations must be finite and positive")
     if not torch.all((controls["movement"] >= 0) & (controls["movement"] <= 2)):
         raise ValueError(f"{episode}: movement contains a non-class value")
     if not torch.all((controls["buttons"] == 0) | (controls["buttons"] == 1)):
         raise ValueError(f"{episode}: buttons must be binary")
-    return controls["raw_mouse_deltas"], controls["fast_durations"]
+    if is_recorded:
+        return controls["raw_mouse_deltas"], controls["fast_durations"]
+    return None, None
+
+
+def _existing_manifest(root: Path, split: str) -> dict[str, Any] | None:
+    path = root / f"{split}.json"
+    if not path.is_file():
+        return None
+    payload: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("split") != split:
+        raise ValueError(f"{path}: existing manifest split does not match {split}")
+    return payload
 
 
 def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalization:
     roots = {train_path.resolve(), validation_path.resolve()}
     if len(roots) != 2:
         raise ValueError("training and validation outputs must be different directories")
-    train_episodes = sorted((train_path / "episodes").glob("*"))
-    validation_episodes = sorted((validation_path / "episodes").glob("*"))
+    train_episodes = sorted(
+        path for path in (train_path / "episodes").glob("*") if path.is_dir()
+    )
+    validation_episodes = sorted(
+        path for path in (validation_path / "episodes").glob("*") if path.is_dir()
+    )
     if not train_episodes or not validation_episodes:
         raise ValueError("both training and validation must contain episodes")
     duplicate_ids = {path.name for path in train_episodes} & {
@@ -609,13 +646,33 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
                 episode / "controls.pt", map_location="cpu", weights_only=True
             )
             num_buttons = int(controls["buttons"].shape[1])
-        raw_parts.append(raw)
-        duration_parts.append(durations)
+        if raw is not None and durations is not None:
+            raw_parts.append(raw)
+            duration_parts.append(durations)
     for episode in validation_episodes:
         _validate_episode(episode, num_buttons)
-    normalization = AxisNormalization.derive(
-        torch.cat(raw_parts), torch.cat(duration_parts)
-    )
+    train_manifest = _existing_manifest(train_path, "train")
+    validation_manifest = _existing_manifest(validation_path, "validation")
+    if validation_manifest is not None and train_manifest is None:
+        raise ValueError("validation manifest exists without a training manifest")
+    if train_manifest is not None:
+        normalization = AxisNormalization.from_manifest(
+            train_manifest.get("axis_normalization")
+        )
+        if validation_manifest is not None:
+            validation_normalization = AxisNormalization.from_manifest(
+                validation_manifest.get("axis_normalization")
+            )
+            if validation_normalization != normalization:
+                raise ValueError("existing train and validation normalization differ")
+    else:
+        if len(raw_parts) != len(train_episodes):
+            raise ValueError(
+                "finalized training episodes require an existing training manifest"
+            )
+        normalization = AxisNormalization.derive(
+            torch.cat(raw_parts), torch.cat(duration_parts)
+        )
     profile_hashes = {
         str(
             json.loads((episode / "episode.json").read_text(encoding="utf-8")).get(
@@ -626,6 +683,14 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
     }
     if len(profile_hashes) != 1:
         raise ValueError("all train and validation episodes must use one control profile")
+    profile_hash = next(iter(profile_hashes))
+    for existing in (train_manifest, validation_manifest):
+        if existing is None:
+            continue
+        if existing.get("num_buttons") != num_buttons:
+            raise ValueError("existing manifest button count does not match episodes")
+        if existing.get("control_profile_sha256") != profile_hash:
+            raise ValueError("existing manifest control profile does not match episodes")
     for root, split, episodes in (
         (train_path, "train", train_episodes),
         (validation_path, "validation", validation_episodes),
@@ -637,19 +702,21 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
                 raise ValueError(f"{episode}: split metadata does not match {split}")
             controls_path = episode / "controls.pt"
             controls = torch.load(controls_path, map_location="cpu", weights_only=True)
-            controls["axes"] = normalization.normalize(
-                controls["raw_mouse_deltas"], controls["fast_durations"]
-            )
-            finalized_controls = {key: controls[key] for key in CONTROL_KEYS}
-            temporary = controls_path.with_suffix(".pt.tmp")
-            torch.save(finalized_controls, temporary)
-            os.replace(temporary, controls_path)
-            metadata["finalized"] = True
-            metadata_temporary = episode / "episode.json.tmp"
-            metadata_temporary.write_text(
-                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-            )
-            os.replace(metadata_temporary, episode / "episode.json")
+            if set(controls) == _RECORDED_CONTROL_KEYS:
+                controls["axes"] = normalization.normalize(
+                    controls["raw_mouse_deltas"], controls["fast_durations"]
+                )
+                finalized_controls = {key: controls[key] for key in CONTROL_KEYS}
+                temporary = controls_path.with_suffix(".pt.tmp")
+                torch.save(finalized_controls, temporary)
+                os.replace(temporary, controls_path)
+            if not metadata.get("finalized"):
+                metadata["finalized"] = True
+                metadata_temporary = episode / "episode.json.tmp"
+                metadata_temporary.write_text(
+                    json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+                )
+                os.replace(metadata_temporary, episode / "episode.json")
             entries.append(_episode_entry(root, episode))
         manifest = {
             "version": 3,
@@ -657,7 +724,7 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
             "channels": ["R", "B"],
             "axis_normalization": normalization.to_manifest(),
             "num_buttons": num_buttons,
-            "control_profile_sha256": next(iter(profile_hashes)),
+            "control_profile_sha256": profile_hash,
             "episodes": entries,
         }
         temporary_manifest = root / f"{split}.json.tmp"
