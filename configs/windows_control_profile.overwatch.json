@@ -1,7 +1,7 @@
 {
   "window": {
     "process_name": "Overwatch.exe",
-    "title_regex": "^Overwatch Application(?:$| - )"
+    "title_regex": "^Overwatch(?:$| - )"
   },
   "movement": {
     "left": "A",
