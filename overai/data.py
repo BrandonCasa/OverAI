@@ -45,6 +45,7 @@ class EpisodeRecord:
     controls_path: Path
     fast_count: int
     slow_count: int
+    discarded_terminal_fast_ticks: int = 0
 
 
 @dataclass(slots=True)
@@ -122,20 +123,25 @@ class SequenceBatch:
         )
 
     def timing_context(self, tick: int, device: torch.device) -> TimingContext:
-        current = self.fast_timestamps[:, tick : tick + 1]
+        # Recording retains float64 timestamps for alignment accuracy. Neural
+        # timing features must enter autocast-capable layers as float32; CUDA
+        # autocast intentionally does not downcast float64 inputs.
+        current = self.fast_timestamps[:, tick : tick + 1].float()
         frame_index = tick // self.fast_ticks_per_video
         slow_index = tick // self.fast_ticks_per_slow
         if tick == 0:
             delta = torch.full_like(current, 1.0 / self.fast_hz)
         else:
-            delta = current - self.fast_timestamps[:, tick - 1 : tick]
+            delta = current - self.fast_timestamps[:, tick - 1 : tick].float()
         return TimingContext(
             absolute_time=current.to(device, non_blocking=True),
             since_video_frame=(
-                current - self.frame_timestamps[:, frame_index : frame_index + 1]
+                current
+                - self.frame_timestamps[:, frame_index : frame_index + 1].float()
             ).to(device, non_blocking=True),
             since_slow_update=(
-                current - self.slow_timestamps[:, slow_index : slow_index + 1]
+                current
+                - self.slow_timestamps[:, slow_index : slow_index + 1].float()
             ).to(device, non_blocking=True),
             fast_delta_time=delta.to(device, non_blocking=True),
         )
@@ -174,7 +180,7 @@ def _validate_controls(
     controls: dict[str, torch.Tensor],
     frame_count: int,
     cfg: ModelConfig,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     fast_count = controls["axes"].shape[0]
     slow_count = controls["movement"].shape[0]
     expected_fast_shapes = {
@@ -200,18 +206,36 @@ def _validate_controls(
             raise ValueError(
                 f"{path}: {key} has shape {tuple(controls[key].shape)}, expected {shape}"
             )
-    if fast_count < cfg.fast_horizon + cfg.fast_hz:
-        raise ValueError(f"{path}: episode is too short for one training window")
-    expected_frames = math.ceil(fast_count / cfg.fast_ticks_per_video)
-    expected_slow = math.ceil(fast_count / cfg.fast_ticks_per_slow)
+    frame_capacity = frame_count * cfg.fast_ticks_per_video
+    slow_capacity = slow_count * cfg.fast_ticks_per_slow
+    if (
+        fast_count > frame_capacity
+        and fast_count - frame_capacity >= cfg.fast_ticks_per_video
+    ):
+        raise ValueError(
+            f"{path}: {fast_count} fast ticks exceed the {frame_count}-frame "
+            "capacity by at least one complete video interval"
+        )
+    if (
+        fast_count > slow_capacity
+        and fast_count - slow_capacity >= cfg.fast_ticks_per_slow
+    ):
+        raise ValueError(
+            f"{path}: {fast_count} fast ticks exceed the {slow_count}-sample "
+            "slow-control capacity by at least one complete slow interval"
+        )
+    usable_fast_count = min(fast_count, frame_capacity, slow_capacity)
+    expected_frames = math.ceil(usable_fast_count / cfg.fast_ticks_per_video)
+    expected_slow = math.ceil(usable_fast_count / cfg.fast_ticks_per_slow)
     if frame_count != expected_frames:
         raise ValueError(
             f"{path}: found {frame_count} frames, expected {expected_frames} "
-            f"for {fast_count} fast ticks"
+            f"for {usable_fast_count} usable fast ticks"
         )
     if slow_count != expected_slow:
         raise ValueError(
-            f"{path}: found {slow_count} slow controls, expected {expected_slow}"
+            f"{path}: found {slow_count} slow controls, expected {expected_slow} "
+            f"for {usable_fast_count} usable fast ticks"
         )
     for key in ("fast_timestamps", "frame_timestamps", "slow_timestamps"):
         values = controls[key].float()
@@ -232,7 +256,7 @@ def _validate_controls(
     buttons = controls["buttons"]
     if not torch.all((buttons == 0) | (buttons == 1)):
         raise ValueError(f"{path}: buttons must be binary states")
-    return fast_count, slow_count
+    return usable_fast_count, expected_slow, fast_count - usable_fast_count
 
 
 def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
@@ -326,12 +350,17 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
             raise ValueError(f"{episode_id}: red/blue frame names do not match")
         frame_pairs = tuple(zip(red_paths, blue_paths, strict=True))
         controls = _load_controls(controls_path)
-        fast_count, slow_count = _validate_controls(
+        fast_count, slow_count, discarded_terminal_fast_ticks = _validate_controls(
             controls_path, controls, len(frame_pairs), cfg
         )
         records.append(
             EpisodeRecord(
-                episode_id, frame_pairs, controls_path, fast_count, slow_count
+                episode_id,
+                frame_pairs,
+                controls_path,
+                fast_count,
+                slow_count,
+                discarded_terminal_fast_ticks,
             )
         )
     return records
@@ -477,4 +506,7 @@ def dataset_summary(path: str | Path, cfg: ModelConfig) -> dict[str, int]:
         "frames": sum(len(record.frame_pairs) for record in records),
         "fast_ticks": sum(record.fast_count for record in records),
         "slow_ticks": sum(record.slow_count for record in records),
+        "discarded_terminal_fast_ticks": sum(
+            record.discarded_terminal_fast_ticks for record in records
+        ),
     }

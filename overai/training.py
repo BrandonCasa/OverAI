@@ -1,4 +1,4 @@
-"""H100-oriented streaming supervised-imitation training entry point."""
+"""CUDA streaming supervised-imitation training entry point."""
 
 from __future__ import annotations
 
@@ -314,11 +314,6 @@ def run_training(
     if not torch.cuda.is_available():
         raise RuntimeError("training requires an NVIDIA CUDA device")
     device = torch.device("cuda")
-    device_name = torch.cuda.get_device_name(0)
-    if "H100" not in device_name:
-        raise RuntimeError(f"production training requires an NVIDIA H100; found {device_name}")
-    if not training_cfg.bf16:
-        raise RuntimeError("production H100 training requires BF16 autocast")
     if training_cfg.bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("the selected CUDA device does not support bfloat16")
     configure_runtime(device, training_cfg.seed)
@@ -382,9 +377,12 @@ def run_training(
     (output_dir / "training_config.json").write_text(
         json.dumps(asdict(training_cfg), indent=2) + "\n", encoding="utf-8"
     )
+    device_properties = torch.cuda.get_device_properties(0)
     print(
-        f"device={torch.cuda.get_device_name(0)} parameters={parameter_count(model):,} "
-        f"windows={len(dataset)} bf16={training_cfg.bf16}"
+        f"device={device_properties.name} "
+        f"vram_gib={device_properties.total_memory / 2**30:.1f} "
+        f"parameters={parameter_count(model):,} windows={len(dataset)} "
+        f"bf16={training_cfg.bf16}"
     )
 
     for epoch in range(start_epoch, training_cfg.epochs):
@@ -466,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-vision", action="store_true")
+    parser.add_argument("--checkpoint-every-steps", type=int, default=250)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--max-batches", type=int)
@@ -486,7 +485,19 @@ def main() -> None:
         )
     )
     if args.validate_only:
-        print(json.dumps(dataset_summary(args.manifest, model_cfg), indent=2))
+        summary = dataset_summary(args.manifest, model_cfg)
+        window_dataset = DemonstrationWindowDataset(
+            args.manifest,
+            model_cfg,
+            history_seconds=args.history_seconds,
+            optimization_seconds=args.optimization_seconds,
+            stride_seconds=args.stride_seconds,
+        )
+        summary["usable_windows"] = len(window_dataset)
+        summary["episodes_with_usable_windows"] = len(
+            {record_index for record_index, _ in window_dataset.windows}
+        )
+        print(json.dumps(summary, indent=2))
         return
     training_cfg = TrainingConfig(
         epochs=args.epochs,
@@ -501,6 +512,7 @@ def main() -> None:
         seed=args.seed,
         bf16=args.bf16,
         compile_vision=args.compile_vision,
+        checkpoint_every_steps=args.checkpoint_every_steps,
     )
     run_training(
         args.manifest,

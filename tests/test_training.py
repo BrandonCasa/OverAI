@@ -54,6 +54,13 @@ class TrainingPipelineTests(unittest.TestCase):
                 cfg.fast_ticks_per_slow, torch.device("cpu")
             )
             self.assertFalse(torch.equal(first_context.health, next_context.health))
+            timing = batch.timing_context(0, torch.device("cpu"))
+            self.assertEqual(timing.absolute_time.dtype, torch.float32)
+            self.assertEqual(timing.since_video_frame.dtype, torch.float32)
+            self.assertEqual(timing.since_slow_update.dtype, torch.float32)
+            self.assertEqual(timing.fast_delta_time.dtype, torch.float32)
+            later_timing = batch.timing_context(1, torch.device("cpu"))
+            self.assertEqual(later_timing.fast_delta_time.dtype, torch.float32)
             self.assertEqual(
                 tuple(batch.load_frame(0, torch.device("cpu")).shape),
                 (1, 2, cfg.image_height, cfg.image_width),
@@ -84,6 +91,32 @@ class TrainingPipelineTests(unittest.TestCase):
             controls["health"][0, 0] = float("nan")
             torch.save(controls, controls_path)
             with self.assertRaisesRegex(ValueError, "health contains non-finite"):
+                dataset_summary(manifest, cfg)
+
+    def test_manifest_discards_one_unpaired_terminal_fast_tick(self) -> None:
+        cfg = ModelConfig.tiny()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = create_synthetic_dataset(root, cfg, seconds=4.0)
+            controls_path = root / "episodes" / "synthetic-001" / "controls.pt"
+            controls = torch.load(controls_path, weights_only=True)
+            controls["fast_timestamps"] = torch.cat(
+                (controls["fast_timestamps"], controls["fast_timestamps"][-1:] + 0.25)
+            )
+            controls["axes"] = torch.cat((controls["axes"], controls["axes"][-1:]))
+            torch.save(controls, controls_path)
+
+            summary = dataset_summary(manifest, cfg)
+            self.assertEqual(summary["fast_ticks"], 16)
+            self.assertEqual(summary["discarded_terminal_fast_ticks"], 1)
+
+            controls = torch.load(controls_path, weights_only=True)
+            controls["fast_timestamps"] = torch.cat(
+                (controls["fast_timestamps"], controls["fast_timestamps"][-1:] + 0.25)
+            )
+            controls["axes"] = torch.cat((controls["axes"], controls["axes"][-1:]))
+            torch.save(controls, controls_path)
+            with self.assertRaisesRegex(ValueError, "complete video interval"):
                 dataset_summary(manifest, cfg)
 
     def test_checkpoint_resume_repeats_partial_epoch_and_validates_calibration(self) -> None:

@@ -13,14 +13,14 @@ The default model is the uploaded specification:
 - two-dimensional discrete movement and configurable button-state control at 5 Hz
 - two bounded continuous axes at 60 Hz
 - parallel 2-second trajectories (10 discrete states and 120 axis samples)
-- fixed-shape H100 BF16 training and RTX 4080-only FP16 TensorRT-RTX deployment
+- fixed-shape CUDA BF16 training and RTX 4080-only FP16 TensorRT-RTX deployment
 
 ## What is implemented
 
 The repository includes the two-channel model, streaming state, memory promotion logic,
 rate-derived runtime scheduler, direct and horizon imitation losses, safe dataset
 validation, incremental JPEG/PNG decoding, truncated backpropagation through time,
-bfloat16 H100 training, format-3 atomic checkpoints, Windows Graphics Capture and
+bfloat16 CUDA training, format-3 atomic checkpoints, Windows Graphics Capture and
 Raw Input recording, dataset finalization with training-only axis calibration,
 fixed-shape ONNX/TensorRT-RTX export, a 60 Hz RTX scheduler, SendInput control,
 latency gates, and deterministic end-to-end tests.
@@ -36,7 +36,7 @@ offline or private-LAN games where automation is permitted.
 ```powershell
 uv sync
 uv run python -m unittest discover -v
-uv run overai-benchmark --model-config configs/h100_1080p.json
+uv run overai-benchmark --model-config configs/rtx4080_1080p.json
 ```
 
 RTX deployment needs Python 3.13 because the TensorRT-RTX wheel does not support
@@ -113,14 +113,23 @@ channel and also return zeros from the deployment adapter. Context is sampled at
 into an earlier timestamp. Record executed inputs, not merely requested inputs,
 so the action-history encoder sees what the game actually received.
 
-Before committing to a long H100 run:
+Before committing to a long GPU run, validate each split independently:
 
 ```powershell
 uv run overai-train `
   --manifest D:\datasets\doom\train.json `
-  --model-config configs/h100_1080p.json `
+  --model-config configs/rtx4080_1080p.json `
+  --validate-only
+uv run overai-train `
+  --manifest D:\datasets\doom\validation.json `
+  --model-config configs/rtx4080_1080p.json `
   --validate-only
 ```
+
+A recorder can close after its last 60 Hz control sample but before the next
+30 Hz frame or 5 Hz discrete sample. Dataset validation safely excludes only
+that incomplete terminal fraction; it still rejects a missing complete interval
+and reports the excluded count as `discarded_terminal_fast_ticks`.
 
 ## Windows recording and dataset finalization
 
@@ -154,37 +163,59 @@ episodes are added atomically to manifests. Axis scales are the 99.5th percentil
 of nonzero absolute training counts/second and are frozen for validation, training,
 and deployment.
 
-## H100 training
+## Local RTX 4080 training
 
-The default H100 command uses 30 seconds of causal warm-up and optimizes two
-seconds at a time. Warm-up is excluded from the gradient tape; the 30-second
-memory still conditions every optimized prediction. The optimization span is
-split into 0.2-second truncated-backprop chunks to bound activation memory.
+The RTX 4080 profile preserves the 1080p model shape. The Overwatch command uses
+10 seconds of causal warm-up while optimizing two seconds at a time so the
+current episode lengths contribute useful windows.
+Warm-up is excluded from the gradient tape; the hierarchical memory still
+conditions every optimized prediction. The optimization span is
+split into 0.1-second truncated-backprop chunks to fit the 16 GB card with
+batch size 1. BF16, gradient checkpointing, fused AdamW, TF32, and flash SDPA are
+enabled where supported.
+
+For the local Overwatch dataset, run the non-training readiness check first:
+
+```powershell
+.\scripts\train-overwatch-rtx4080.ps1
+```
+
+That command checks the exact GPU, BF16 support, model configuration, and both
+manifests. It will not start training. Start the full run explicitly with:
+
+```powershell
+.\scripts\train-overwatch-rtx4080.ps1 -Train
+```
+
+The equivalent direct command is:
 
 ```powershell
 uv run overai-train `
-  --manifest D:\datasets\doom\train.json `
-  --model-config configs/h100_1080p.json `
-  --output runs/doom-h100 `
+  --manifest C:\Users\brand\Documents\overai\Overwatch\train\train.json `
+  --model-config configs/rtx4080_1080p.json `
+  --output runs/overwatch-4080 `
   --batch-size 1 `
   --epochs 20 `
-  --history-seconds 30 `
+  --history-seconds 10 `
   --optimization-seconds 2 `
   --stride-seconds 2 `
-  --tbptt-seconds 0.2 `
+  --tbptt-seconds 0.1 `
+  --num-workers 2 `
+  --checkpoint-every-steps 120 `
   --bf16
 ```
 
 Optional `--compile-vision` can improve steady-state throughput, but first-run
-compilation is slow. Resume without changing the model configuration:
+compilation is slow. Resume with the helper so all memory-related settings remain
+unchanged:
 
 ```powershell
-uv run overai-train `
-  --manifest D:\datasets\doom\train.json `
-  --model-config configs/h100_1080p.json `
-  --output runs/doom-h100 `
-  --resume runs/doom-h100/checkpoint_last.pt
+.\scripts\train-overwatch-rtx4080.ps1 -Train -Resume runs\overwatch-4080\checkpoint_last.pt
 ```
+
+Resume must keep the same model and dataset calibration. Add `-CompileVision`
+only after the first uncompiled run is stable; compilation increases startup
+time and can consume extra memory.
 
 Use a separate episode manifest for validation. Accuracy should include discrete
 class accuracy/F1, axis Huber error, derivative error, and held-out closed-loop
@@ -198,9 +229,9 @@ strongly typed FP16 TensorRT-RTX engines: ordinary video, intermediate promotion
 long promotion, between-frame fast control, and phase-correct slow control.
 
 ```powershell
-.venv\Scripts\overai-export-rtx.exe --checkpoint runs\doom-h100\checkpoint_last.pt --output artifacts\doom-4080
-.venv\Scripts\overai-benchmark-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json --duration 600
-.venv\Scripts\overai-run-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json
+.venv\Scripts\overai-export-rtx.exe --checkpoint runs\overwatch-4080\checkpoint_last.pt --output artifacts\overwatch-4080
+.venv\Scripts\overai-benchmark-rtx.exe --artifact artifacts\overwatch-4080 --profile configs\my-profile.json --duration 600
+.venv\Scripts\overai-run-rtx.exe --artifact artifacts\overwatch-4080 --profile configs\my-profile.json
 ```
 
 Exports keep LayerNorm and attention SDPA/softmax in FP16 by default. If trained-
@@ -242,7 +273,7 @@ from overai.runtime import load_controller_checkpoint, run_realtime
 from my_doom_adapter import DoomAdapter
 
 device = torch.device("cuda")
-model = load_controller_checkpoint("runs/doom-h100/checkpoint_last.pt", device)
+model = load_controller_checkpoint("runs/overwatch-4080/checkpoint_last.pt", device)
 run_realtime(model, DoomAdapter(), device=device)
 ```
 

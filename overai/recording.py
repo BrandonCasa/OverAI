@@ -379,6 +379,7 @@ class EpisodeRecorder:
         frame_index = 0
         fast_index = 0
         slow_index = 0
+        capture_timeout_ms = max(1, math.ceil(1000 / self.cfg.video_hz))
         failure: BaseException | None = None
         try:
             while maximum_ticks is None or fast_index < maximum_ticks:
@@ -409,12 +410,19 @@ class EpisodeRecorder:
                 previous_fast = now
                 if fast_index % self.cfg.fast_ticks_per_video == 0:
                     # Startup capture happens before the recording clock begins.
-                    # Later samples remain non-blocking to preserve cadence.
+                    # Give later samples one video interval to absorb normal WGC
+                    # callback jitter. A zero-timeout poll can miss a frame that
+                    # arrives moments later and used to silently truncate an episode.
                     captured_frame = initial_frame if fast_index == 0 else None
                     if captured_frame is None:
-                        captured = self.backend.latest_frame(timeout_ms=0)
+                        captured = self.backend.latest_frame(
+                            timeout_ms=capture_timeout_ms
+                        )
                         if captured is None:
-                            break
+                            raise RuntimeError(
+                                "no fresh Windows Graphics Capture frame within "
+                                f"{capture_timeout_ms} ms at video frame {frame_index}"
+                            )
                         captured_frame = coerce_captured_frame(captured)
                     captured_at = (
                         start if fast_index == 0 else captured_frame.timestamp

@@ -80,6 +80,14 @@ class _SyntheticBackend:
         return False
 
 
+class _FrameAvailableOnlyWhenWaitedForBackend(_SyntheticBackend):
+    def latest_frame(self, timeout_ms: int):
+        if self.capture_calls > 0 and timeout_ms == 0:
+            self.frame_timeouts.append(timeout_ms)
+            return None
+        return super().latest_frame(timeout_ms)
+
+
 class RecordingTests(unittest.TestCase):
     def _profile_path(self, root: Path) -> Path:
         path = root / "profile.json"
@@ -192,7 +200,29 @@ class RecordingTests(unittest.TestCase):
             self.assertLess(float(controls["fast_timestamps"][0]), 0.03)
             self.assertAlmostEqual(float(controls["frame_timestamps"][0]), 0.0, places=4)
             self.assertEqual(backend.frame_timeouts[0], 2000)
-            self.assertTrue(all(timeout == 0 for timeout in backend.frame_timeouts[1:]))
+            self.assertTrue(all(timeout == 34 for timeout in backend.frame_timeouts[1:]))
+
+    def test_subsequent_capture_waits_for_wgc_callback_jitter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _FrameAvailableOnlyWhenWaitedForBackend(
+                cfg, pause_after_first=False
+            )
+            episode = EpisodeRecorder(
+                backend, profile, cfg, root, "train", "wgc-jitter"
+            ).record(duration_seconds=0.2)
+            controls = torch.load(episode / "controls.pt", weights_only=True)
+            self.assertEqual(controls["fast_timestamps"].shape[0], 12)
+            self.assertEqual(controls["frame_timestamps"].shape[0], 6)
+            self.assertEqual(backend.frame_timeouts, [2000, 34, 34, 34, 34, 34])
 
     def test_jpeg_worker_failure_cannot_deadlock_recorder_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
