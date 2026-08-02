@@ -141,8 +141,19 @@ class SequenceBatch:
         )
 
 
-@lru_cache(maxsize=32)
 def _load_controls(path: Path) -> dict[str, torch.Tensor]:
+    stat = path.stat()
+    return _load_controls_cached(path, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=32)
+def _load_controls_cached(
+    path: Path, modified_ns: int, size: int
+) -> dict[str, torch.Tensor]:
+    # File metadata is intentionally part of the cache key. Dataset windows reuse
+    # the same control tensors heavily, while a rewritten controls.pt must not
+    # continue serving the previous tensors from a long-lived worker process.
+    del modified_ns, size
     loaded = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(loaded, dict):
         raise TypeError(f"{path} must contain a tensor dictionary")
@@ -204,13 +215,18 @@ def _validate_controls(
         )
     for key in ("fast_timestamps", "frame_timestamps", "slow_timestamps"):
         values = controls[key].float()
-        if values.numel() > 1 and not torch.all(values[1:] > values[:-1]):
-            raise ValueError(f"{path}: {key} must be strictly increasing")
+        if not torch.isfinite(values).all() or (
+            values.numel() > 1 and not torch.all(values[1:] > values[:-1])
+        ):
+            raise ValueError(f"{path}: {key} must be finite and strictly increasing")
     movement = controls["movement"]
     if movement.dtype.is_floating_point or movement.min() < 0 or movement.max() > 2:
         raise ValueError(f"{path}: movement must contain integer classes 0, 1, or 2")
     if not torch.isfinite(controls["axes"]).all():
         raise ValueError(f"{path}: axes contains non-finite values")
+    for key in ("health", "damage_events", "kill_events", "charge"):
+        if not torch.isfinite(controls[key]).all():
+            raise ValueError(f"{path}: {key} contains non-finite values")
     if controls["axes"].abs().max() > 1.0001:
         raise ValueError(f"{path}: axes must be normalized to [-1, 1]")
     buttons = controls["buttons"]
@@ -389,6 +405,22 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
         last_slow = (process_end - 1) // self.cfg.fast_ticks_per_slow
         slow_end = last_slow + self.cfg.slow_horizon
 
+        initial_axes = (
+            torch.zeros_like(controls["axes"][0])
+            if base_tick == 0
+            else controls["axes"][base_tick - 1]
+        )
+        initial_movement = (
+            torch.ones_like(controls["movement"][0])
+            if base_slow == 0
+            else controls["movement"][base_slow - 1]
+        )
+        initial_buttons = (
+            torch.zeros_like(controls["buttons"][0])
+            if base_slow == 0
+            else controls["buttons"][base_slow - 1]
+        )
+
         return {
             "frame_pairs": list(record.frame_pairs[base_frame:frame_end]),
             "fast_timestamps": controls["fast_timestamps"][base_tick:fast_end],
@@ -401,9 +433,9 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             "axes": controls["axes"][base_tick:fast_end],
             "movement": controls["movement"][base_slow:slow_end],
             "buttons": controls["buttons"][base_slow:slow_end],
-            "initial_axes": controls["axes"][max(base_tick - 1, 0)],
-            "initial_movement": controls["movement"][max(base_slow - 1, 0)],
-            "initial_buttons": controls["buttons"][max(base_slow - 1, 0)],
+            "initial_axes": initial_axes,
+            "initial_movement": initial_movement,
+            "initial_buttons": initial_buttons,
         }
 
     def collate(self, samples: Sequence[dict[str, Any]]) -> SequenceBatch:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -23,6 +24,19 @@ def _elapsed_ms(call: Callable[[], None], iterations: int) -> float:
     end.record()
     end.synchronize()
     return start.elapsed_time(end) / iterations
+
+
+def _scheduled_paths(cfg: ModelConfig) -> set[str]:
+    period = math.lcm(cfg.fast_ticks_per_video, cfg.fast_ticks_per_slow)
+    paths: set[str] = set()
+    for tick in range(period):
+        video_due = tick % cfg.fast_ticks_per_video == 0
+        slow_due = tick % cfg.fast_ticks_per_slow == 0
+        paths.add(
+            ("video" if video_due else "fast")
+            + ("+slow" if slow_due else "")
+        )
+    return paths
 
 
 def main() -> None:
@@ -80,6 +94,10 @@ def main() -> None:
         nonlocal state
         _, state = model.slow_tick(state)
 
+    def fast_slow() -> None:
+        fast()
+        slow()
+
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         for _ in range(args.warmup):
             video(True)
@@ -89,16 +107,26 @@ def main() -> None:
         fast_ms = _elapsed_ms(fast, args.iterations)
         slow_ms = _elapsed_ms(slow, args.iterations)
         combined_ms = _elapsed_ms(lambda: video(True), args.iterations)
+        fast_slow_ms = _elapsed_ms(fast_slow, args.iterations)
 
-    video_budget = 1000.0 / cfg.video_hz
     fast_budget = 1000.0 / cfg.fast_hz
-    slow_budget = 1000.0 / cfg.slow_hz
+    path_latencies = {
+        "video": video_ms,
+        "fast": fast_ms,
+        "video+slow": combined_ms,
+        "fast+slow": fast_slow_ms,
+    }
+    scheduled_paths = _scheduled_paths(cfg)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"video+memory+fast: {video_ms:.2f} ms / {video_budget:.2f} ms")
+    print(f"video+memory+fast: {video_ms:.2f} ms / {fast_budget:.2f} ms")
     print(f"between-frame fast: {fast_ms:.2f} ms / {fast_budget:.2f} ms")
-    print(f"slow decoder: {slow_ms:.2f} ms / {slow_budget:.2f} ms")
-    print(f"video+fast+slow boundary: {combined_ms:.2f} ms")
-    realtime = video_ms <= video_budget and fast_ms <= fast_budget
+    print(f"slow decoder alone: {slow_ms:.2f} ms")
+    print(f"video+fast+slow boundary: {combined_ms:.2f} ms / {fast_budget:.2f} ms")
+    print(f"between-frame fast+slow boundary: {fast_slow_ms:.2f} ms / {fast_budget:.2f} ms")
+    realtime = all(
+        path_latencies[path] <= fast_budget for path in scheduled_paths
+    )
+    print(f"scheduled paths: {', '.join(sorted(scheduled_paths))}")
     print(f"core realtime deadlines: {'PASS' if realtime else 'FAIL'}")
 
 

@@ -8,6 +8,8 @@ dependencies = [
     "accelerate",
     "einops",
     "nvidia-ml-py",
+    "onnx>=1.18",
+    "onnxscript>=0.4",
     "safetensors",
     "torch",
     "torchvision",
@@ -45,7 +47,5 @@ recording = [
     "windows-capture>=1.0.45; sys_platform == 'win32'",
 ]
 rtx = [
-    "onnx>=1.18",
-    "onnxscript>=0.4",
     "tensorrt-rtx==1.5.0.114; sys_platform == 'win32' and python_version < '3.14'",
 ]

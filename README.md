@@ -193,9 +193,9 @@ can recover from its own mistakes.
 
 ## RTX 4080 deployment
 
-Export on the deployment RTX 4080. This produces four fixed-shape graphs and
+Export on the deployment RTX 4080. This produces five fixed-shape graphs and
 strongly typed FP16 TensorRT-RTX engines: ordinary video, intermediate promotion,
-long promotion, and between-frame fast tick.
+long promotion, between-frame fast control, and phase-correct slow control.
 
 ```powershell
 .venv\Scripts\overai-export-rtx.exe --checkpoint runs\doom-h100\checkpoint_last.pt --output artifacts\doom-4080

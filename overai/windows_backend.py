@@ -242,6 +242,8 @@ class WindowsCaptureBackend:
         self._input_thread: threading.Thread | None = None
         self._input_hwnd: int | None = None
         self._input_thread_id: int | None = None
+        self._input_ready = threading.Event()
+        self._input_error: BaseException | None = None
         self._capture_control = None
         self._wndproc: object | None = None
         self._injected_held: set[str] = set()
@@ -321,6 +323,8 @@ class WindowsCaptureBackend:
     def _input_loop(self) -> None:
         instance = kernel32.GetModuleHandleW(None)
         class_name = f"OverAIRawInput_{os.getpid()}_{id(self)}"
+        class_registered = False
+        hwnd: int | None = None
 
         @WNDPROC
         def wndproc(hwnd: int, message: int, wparam: int, lparam: int) -> int:
@@ -332,70 +336,104 @@ class WindowsCaptureBackend:
                 return 0
             return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
-        self._wndproc = wndproc
-        window_class = WNDCLASSW(
-            0,
-            wndproc,
-            0,
-            0,
-            instance,
-            None,
-            None,
-            None,
-            None,
-            class_name,
+        try:
+            self._wndproc = wndproc
+            window_class = WNDCLASSW(
+                0,
+                wndproc,
+                0,
+                0,
+                instance,
+                None,
+                None,
+                None,
+                None,
+                class_name,
+            )
+            if not user32.RegisterClassW(ctypes.byref(window_class)):
+                _raise_last_error("RegisterClassW failed")
+            class_registered = True
+            hwnd = user32.CreateWindowExW(
+                0,
+                class_name,
+                class_name,
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                instance,
+                None,
+            )
+            if not hwnd:
+                _raise_last_error("CreateWindowExW failed")
+            self._input_hwnd = hwnd
+            self._input_thread_id = kernel32.GetCurrentThreadId()
+            devices = (RAWINPUTDEVICE * 2)(
+                RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK, hwnd),
+                RAWINPUTDEVICE(0x01, 0x06, RIDEV_INPUTSINK, hwnd),
+            )
+            if not user32.RegisterRawInputDevices(
+                devices, len(devices), ctypes.sizeof(RAWINPUTDEVICE)
+            ):
+                _raise_last_error("RegisterRawInputDevices failed")
+            self._input_ready.set()
+            message = wintypes.MSG()
+            while True:
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result == -1:
+                    _raise_last_error("GetMessageW failed")
+                if result == 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        except BaseException as error:
+            self._input_error = error
+            self._emergency = True
+            self._input_ready.set()
+        finally:
+            if hwnd:
+                user32.DestroyWindow(hwnd)
+            if class_registered:
+                user32.UnregisterClassW(class_name, instance)
+            self._input_hwnd = None
+            self._input_thread_id = None
+
+    def _start_raw_input(self) -> None:
+        self._input_ready.clear()
+        self._input_error = None
+        self._input_thread = threading.Thread(
+            target=self._input_loop, name="overai-raw-input", daemon=True
         )
-        if not user32.RegisterClassW(ctypes.byref(window_class)):
-            _raise_last_error("RegisterClassW failed")
-        hwnd = user32.CreateWindowExW(
-            0,
-            class_name,
-            class_name,
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            None,
-            instance,
-            None,
-        )
-        if not hwnd:
-            _raise_last_error("CreateWindowExW failed")
-        self._input_hwnd = hwnd
-        self._input_thread_id = kernel32.GetCurrentThreadId()
-        devices = (RAWINPUTDEVICE * 2)(
-            RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK, hwnd),
-            RAWINPUTDEVICE(0x01, 0x06, RIDEV_INPUTSINK, hwnd),
-        )
-        if not user32.RegisterRawInputDevices(
-            devices, len(devices), ctypes.sizeof(RAWINPUTDEVICE)
-        ):
-            _raise_last_error("RegisterRawInputDevices failed")
-        message = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(message))
-            user32.DispatchMessageW(ctypes.byref(message))
-        user32.DestroyWindow(hwnd)
-        user32.UnregisterClassW(class_name, instance)
+        self._input_thread.start()
+        if not self._input_ready.wait(timeout=2.0):
+            self._emergency = True
+            self.stop()
+            raise RuntimeError("Raw Input initialization timed out")
+        if self._input_error is not None:
+            self._input_thread.join(timeout=2.0)
+            self._input_thread = None
+            raise RuntimeError("Raw Input initialization failed") from self._input_error
 
     def start(self) -> None:
         try:
             import windows_capture  # pyright: ignore[reportMissingImports]
         except ImportError as error:
             raise RuntimeError("install the recording dependency group") from error
-        self._input_thread = threading.Thread(
-            target=self._input_loop, name="overai-raw-input", daemon=True
-        )
-        self._input_thread.start()
-        capture = windows_capture.WindowsCapture(
-            cursor_capture=False,
-            draw_border=False,
-            minimum_update_interval=1,
-            dirty_region=False,
-            window_hwnd=self.target_hwnd,
-        )
+        self._start_raw_input()
+        try:
+            capture = windows_capture.WindowsCapture(
+                cursor_capture=False,
+                draw_border=False,
+                minimum_update_interval=1,
+                dirty_region=False,
+                window_hwnd=self.target_hwnd,
+            )
+        except BaseException:
+            self.stop()
+            raise
 
         @capture.event
         def on_frame_arrived(frame, _capture_control) -> None:
@@ -463,7 +501,11 @@ class WindowsCaptureBackend:
         def on_closed() -> None:
             self._emergency = True
 
-        self._capture_control = capture.start_free_threaded()
+        try:
+            self._capture_control = capture.start_free_threaded()
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self._capture_control is not None:
@@ -474,6 +516,7 @@ class WindowsCaptureBackend:
         if self._input_thread is not None:
             self._input_thread.join(timeout=2)
             self._input_thread = None
+        self._input_thread_id = None
 
     def latest_frame(self, timeout_ms: int) -> CapturedFrame | None:
         deadline = time.perf_counter() + timeout_ms / 1000

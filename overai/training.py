@@ -233,6 +233,7 @@ def save_checkpoint(
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
     telemetry: dict[str, Any],
+    epoch_complete: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -247,6 +248,7 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
+            "epoch_complete": epoch_complete,
             "global_step": global_step,
         },
         temporary,
@@ -258,6 +260,10 @@ def load_checkpoint(
     path: Path,
     model: HierarchicalImitationController,
     optimizer: torch.optim.Optimizer,
+    *,
+    axis_normalization: dict[str, Any],
+    control_profile_sha256: str,
+    telemetry: dict[str, Any],
 ) -> tuple[int, int]:
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
@@ -266,9 +272,22 @@ def load_checkpoint(
         raise ValueError("unsupported checkpoint format")
     if checkpoint_data.get("model_config") != model.cfg.to_dict():
         raise ValueError("checkpoint model configuration does not match")
+    if checkpoint_data.get("axis_normalization") != axis_normalization:
+        raise ValueError("checkpoint axis normalization does not match dataset")
+    if checkpoint_data.get("control_profile_sha256") != control_profile_sha256:
+        raise ValueError("checkpoint control profile does not match dataset")
+    checkpoint_telemetry = checkpoint_data.get(
+        "telemetry", {"provider": "zero", "sha256": None}
+    )
+    if checkpoint_telemetry != telemetry:
+        raise ValueError("checkpoint telemetry configuration does not match dataset")
     model.load_state_dict(checkpoint_data["model"])
     optimizer.load_state_dict(checkpoint_data["optimizer"])
-    return int(checkpoint_data["epoch"]), int(checkpoint_data["global_step"])
+    checkpoint_epoch = int(checkpoint_data["epoch"])
+    resume_epoch = checkpoint_epoch + int(
+        bool(checkpoint_data.get("epoch_complete", False))
+    )
+    return resume_epoch, int(checkpoint_data["global_step"])
 
 
 def _make_optimizer(
@@ -342,8 +361,14 @@ def run_training(
     start_epoch = 0
     global_step = 0
     if resume is not None:
-        start_epoch, global_step = load_checkpoint(resume, model, optimizer)
-        start_epoch += 1
+        start_epoch, global_step = load_checkpoint(
+            resume,
+            model,
+            optimizer,
+            axis_normalization=axis_normalization,
+            control_profile_sha256=control_profile_sha256,
+            telemetry=telemetry,
+        )
     if training_cfg.compile_vision:
         if not hasattr(model.vision, "compile"):
             raise RuntimeError("this PyTorch build does not provide nn.Module.compile")
@@ -365,6 +390,7 @@ def run_training(
     for epoch in range(start_epoch, training_cfg.epochs):
         epoch_start = time.perf_counter()
         epoch_losses: list[float] = []
+        processed_batches = 0
         for batch_index, batch in enumerate(loader):
             result = train_sequence_batch(
                 model,
@@ -377,6 +403,7 @@ def run_training(
             )
             global_step += result.optimizer_steps
             epoch_losses.append(result.mean_loss)
+            processed_batches = batch_index + 1
             print(
                 f"epoch={epoch + 1}/{training_cfg.epochs} batch={batch_index + 1}/"
                 f"{len(loader)} step={global_step} loss={result.mean_loss:.5f}"
@@ -395,6 +422,7 @@ def run_training(
                     axis_normalization,
                     control_profile_sha256,
                     telemetry,
+                    epoch_complete=False,
                 )
             if max_batches is not None and batch_index + 1 >= max_batches:
                 break
@@ -414,6 +442,7 @@ def run_training(
             axis_normalization,
             control_profile_sha256,
             telemetry,
+            epoch_complete=processed_batches == len(loader),
         )
 
 

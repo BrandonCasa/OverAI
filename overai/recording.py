@@ -21,6 +21,7 @@ from torchvision.io import write_jpeg
 
 from .config import ModelConfig
 from .telemetry import (
+    CapturedFrame,
     HudTelemetryConfig,
     TelemetryWorker,
     coerce_captured_frame,
@@ -271,6 +272,7 @@ class EpisodeRecorder:
         blue_dir.mkdir(parents=True)
         encode_queue: queue.Queue[_EncodedFrame | None] = queue.Queue(maxsize=16)
         encode_error: list[BaseException] = []
+        encoder_timeout_seconds = 30.0
 
         def encode_worker() -> None:
             try:
@@ -293,6 +295,38 @@ class EpisodeRecorder:
 
         worker = threading.Thread(target=encode_worker, name="overai-jpeg", daemon=True)
         worker.start()
+
+        def enqueue_frame(item: _EncodedFrame) -> None:
+            deadline = time.perf_counter() + encoder_timeout_seconds
+            while True:
+                if encode_error or not worker.is_alive():
+                    cause = encode_error[0] if encode_error else None
+                    raise RuntimeError("JPEG encoder failed") from cause
+                try:
+                    encode_queue.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    if time.perf_counter() >= deadline:
+                        raise RuntimeError("JPEG encoder stopped consuming frames")
+
+        def finish_encoder() -> None:
+            deadline = time.perf_counter() + encoder_timeout_seconds
+            sentinel_sent = False
+            while worker.is_alive() and time.perf_counter() < deadline:
+                try:
+                    encode_queue.put(None, timeout=0.05)
+                    sentinel_sent = True
+                    break
+                except queue.Full:
+                    continue
+            if sentinel_sent:
+                worker.join(timeout=max(0.0, deadline - time.perf_counter()))
+            else:
+                worker.join(timeout=0)
+            if worker.is_alive():
+                encode_error.append(
+                    RuntimeError("JPEG encoder did not shut down within 30 seconds")
+                )
         telemetry = self.telemetry_worker or create_telemetry_worker(
             self.profile.telemetry_provider, self.profile.hud_telemetry
         )
@@ -308,23 +342,45 @@ class EpisodeRecorder:
         try:
             self.backend.start()
         except BaseException:
-            telemetry.stop(drain=False)
-            encode_queue.put(None)
-            worker.join()
+            try:
+                telemetry.stop(drain=False)
+            finally:
+                finish_encoder()
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise
-        start = time.perf_counter()
+        maximum_ticks = (
+            None
+            if duration_seconds is None
+            else max(0, math.ceil(duration_seconds * self.cfg.fast_hz))
+        )
+        initial_frame: CapturedFrame | None = None
+        if maximum_ticks is None or maximum_ticks > 0:
+            try:
+                captured = self.backend.latest_frame(timeout_ms=2000)
+                if captured is None:
+                    raise RuntimeError("no fresh Windows Graphics Capture frame")
+                initial_frame = coerce_captured_frame(captured)
+            except BaseException:
+                try:
+                    self.backend.stop()
+                finally:
+                    try:
+                        telemetry.stop(drain=False)
+                    finally:
+                        finish_encoder()
+                    shutil.rmtree(temporary_dir, ignore_errors=True)
+                raise
+            # The initial frame establishes readiness, not elapsed recording time.
+            # Treat it as the observation at t=0 after all startup work is complete.
+            start = time.perf_counter()
+        else:
+            start = time.perf_counter()
         previous_fast = start
         frame_index = 0
         fast_index = 0
         slow_index = 0
         failure: BaseException | None = None
         try:
-            maximum_ticks = (
-                None
-                if duration_seconds is None
-                else max(0, math.ceil(duration_seconds * self.cfg.fast_hz))
-            )
             while maximum_ticks is None or fast_index < maximum_ticks:
                 if self.backend.emergency_stop_requested():
                     break
@@ -352,18 +408,17 @@ class EpisodeRecorder:
                 fast_deltas.append(self.backend.drain_mouse_deltas(previous_fast, now))
                 previous_fast = now
                 if fast_index % self.cfg.fast_ticks_per_video == 0:
-                    # Windows Graphics Capture begins on a background thread.  Give
-                    # its first frame a bounded startup window; later samples must
-                    # remain non-blocking to preserve the requested cadence.
-                    captured = self.backend.latest_frame(
-                        timeout_ms=2000 if frame_index == 0 else 0
-                    )
-                    if captured is None:
-                        if frame_index:
+                    # Startup capture happens before the recording clock begins.
+                    # Later samples remain non-blocking to preserve cadence.
+                    captured_frame = initial_frame if fast_index == 0 else None
+                    if captured_frame is None:
+                        captured = self.backend.latest_frame(timeout_ms=0)
+                        if captured is None:
                             break
-                        raise RuntimeError("no fresh Windows Graphics Capture frame")
-                    captured_frame = coerce_captured_frame(captured)
-                    captured_at = captured_frame.timestamp
+                        captured_frame = coerce_captured_frame(captured)
+                    captured_at = (
+                        start if fast_index == 0 else captured_frame.timestamp
+                    )
                     frame = captured_frame.model_channels
                     if tuple(frame.shape) != (
                         self.cfg.input_channels,
@@ -372,7 +427,7 @@ class EpisodeRecorder:
                     ) or frame.dtype != torch.uint8:
                         raise ValueError("native capture returned an invalid RB frame")
                     telemetry.submit(captured_frame)
-                    encode_queue.put(_EncodedFrame(frame_index, frame.cpu()))
+                    enqueue_frame(_EncodedFrame(frame_index, frame.cpu()))
                     frame_timestamps.append(captured_at - start)
                     frame_index += 1
                 if fast_index % self.cfg.fast_ticks_per_slow == 0:
@@ -392,9 +447,10 @@ class EpisodeRecorder:
             try:
                 self.backend.stop()
             finally:
-                telemetry.stop()
-                encode_queue.put(None)
-                worker.join()
+                try:
+                    telemetry.stop()
+                finally:
+                    finish_encoder()
         if failure is not None:
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise failure
@@ -498,6 +554,8 @@ def _validate_episode(
     for name in ("health", "damage_events", "kill_events", "charge"):
         if controls[name].shape != (slow_count, 1):
             raise ValueError(f"{episode}: {name} must have shape [T_slow, 1]")
+        if not torch.isfinite(controls[name]).all():
+            raise ValueError(f"{episode}: {name} must contain only finite values")
     for name in ("fast_timestamps", "frame_timestamps", "slow_timestamps"):
         values = controls[name]
         if not torch.isfinite(values).all() or (

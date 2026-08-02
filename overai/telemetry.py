@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass
+from functools import cache
 from typing import Any, Protocol, cast
 
 import torch
@@ -309,6 +310,20 @@ _GLYPHS = {
 }
 
 
+@cache
+def _normalized_glyph_template(char: str) -> torch.Tensor:
+    """Build one shared, read-only OCR template for the finite glyph alphabet."""
+
+    template = torch.tensor(
+        [[cell == "1" for cell in row] for row in _GLYPHS[char]],
+        dtype=torch.bool,
+    )
+    template = template[template.any(dim=1)][:, template.any(dim=0)]
+    return F.interpolate(
+        template.float()[None, None], size=(14, 10), mode="nearest"
+    )[0, 0]
+
+
 class BitmapGlyphOcr:
     """Small deterministic OCR for fixed bitmap HUD digits and synthetic tests.
 
@@ -373,14 +388,7 @@ class BitmapGlyphOcr:
             best_char = ""
             best_score = -1.0
             for char in allowed:
-                template = torch.tensor(
-                    [[cell == "1" for cell in row] for row in _GLYPHS[char]],
-                    dtype=torch.bool,
-                )
-                template = template[template.any(dim=1)][:, template.any(dim=0)]
-                resized_template = F.interpolate(
-                    template.float()[None, None], size=(14, 10), mode="nearest"
-                )[0, 0]
+                resized_template = _normalized_glyph_template(char)
                 score = 1.0 - float((normalized - resized_template).abs().mean())
                 if score > best_score:
                     best_char, best_score = char, score

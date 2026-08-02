@@ -37,7 +37,7 @@ from .types import (
 
 RTX_GPU_NAME = "NVIDIA GeForce RTX 4080"
 RTX_COMPUTE_CAPABILITY = (8, 9)
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 
 
 def _torch_dtype(trt_dtype: Any) -> torch.dtype:
@@ -141,7 +141,7 @@ class TensorRtxEngine:
 
 
 class Rtx4080Controller:
-    """Deterministic fixed-rate state machine over the four TensorRT engines."""
+    """Deterministic fixed-rate state machine over the TensorRT engines."""
 
     def __init__(self, artifact_dir: Path, device: torch.device) -> None:
         manifest = json.loads(
@@ -186,11 +186,15 @@ class Rtx4080Controller:
         metadata: dict[str, torch.Tensor],
         frame: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        slow_due = tick % self.cfg.fast_ticks_per_slow == 0
         if frame is not None:
             self.video_frame_index += 1
-            if self.video_frame_index % 30 == 0:
+            frames_per_long = (
+                self.cfg.frames_per_intermediate * self.cfg.intermediate_per_long
+            )
+            if self.video_frame_index % frames_per_long == 0:
                 name = "video_long"
-            elif self.video_frame_index % 6 == 0:
+            elif self.video_frame_index % self.cfg.frames_per_intermediate == 0:
                 name = "video_intermediate"
             else:
                 name = "video_ordinary"
@@ -228,24 +232,37 @@ class Rtx4080Controller:
             ):
                 self.state[key].copy_(outputs[f"next_{key}"])
             self.state["shared_tokens"].copy_(outputs["shared_tokens"])
-            movement = outputs.get("immediate_movement_logits")
-            buttons = outputs.get("immediate_button_logits")
-            return outputs["immediate_axes"], movement, buttons
-        inputs = {
-            **self._metadata(metadata),
-            "shared_tokens": self.state["shared_tokens"],
-            "fast_hidden": self.state["fast_hidden"],
-            "fast_previous_trajectory": self.state["fast_previous_trajectory"],
-            "previous_axis_trajectory": self.state["previous_axis_trajectory"],
-            "previous_slow_trajectory": self.state["previous_slow_trajectory"],
-        }
-        outputs = self.engines["fast_tick"].execute(inputs)
-        self.state["fast_hidden"].copy_(outputs["next_fast_hidden"])
-        self.state["fast_previous_trajectory"].copy_(
-            outputs["next_fast_previous_trajectory"]
+            axes = outputs["immediate_axes"]
+        else:
+            inputs = {
+                **self._metadata(metadata),
+                "shared_tokens": self.state["shared_tokens"],
+                "fast_hidden": self.state["fast_hidden"],
+                "fast_previous_trajectory": self.state["fast_previous_trajectory"],
+                "previous_axis_trajectory": self.state["previous_axis_trajectory"],
+                "previous_slow_trajectory": self.state["previous_slow_trajectory"],
+            }
+            outputs = self.engines["fast_tick"].execute(inputs)
+            self.state["fast_hidden"].copy_(outputs["next_fast_hidden"])
+            self.state["fast_previous_trajectory"].copy_(
+                outputs["next_fast_previous_trajectory"]
+            )
+            self.state["previous_axis_trajectory"].copy_(outputs["axis_trajectory"])
+            axes = outputs["immediate_axes"]
+
+        if not slow_due:
+            return axes, None, None
+        slow_outputs = self.engines["slow_tick"].execute(
+            {"shared_tokens": self.state["shared_tokens"]}
         )
-        self.state["previous_axis_trajectory"].copy_(outputs["axis_trajectory"])
-        return outputs["immediate_axes"], None, None
+        self.state["previous_slow_trajectory"].copy_(
+            slow_outputs["next_previous_slow_trajectory"]
+        )
+        return (
+            axes,
+            slow_outputs["immediate_movement_logits"],
+            slow_outputs["immediate_button_logits"],
+        )
 
 
 def _checkpoint_sha256(path: Path) -> str:
@@ -368,9 +385,15 @@ class VideoPath(nn.Module):
         if self.variant == "ordinary":
             frame_counter, intermediate_counter = 0, 0
         elif self.variant == "intermediate":
-            frame_counter, intermediate_counter = 5, 0
+            frame_counter = self.model.cfg.frames_per_intermediate - 1
+            intermediate_counter = 0
         else:
-            frame_counter, intermediate_counter = 29, 4
+            frame_counter = (
+                self.model.cfg.frames_per_intermediate
+                * self.model.cfg.intermediate_per_long
+                - 1
+            )
+            intermediate_counter = self.model.cfg.intermediate_per_long - 1
         state = ControllerState(
             memory=HierarchicalMemoryState(
                 recent,
@@ -394,7 +417,7 @@ class VideoPath(nn.Module):
             metadata[1],
             metadata[2],
             state,
-            run_slow_decoder=self.variant != "ordinary",
+            run_slow_decoder=False,
         )
         next_state = output.state
         shared = next_state.shared_tokens
@@ -414,14 +437,7 @@ class VideoPath(nn.Module):
             output.fast.immediate_axes,
             output.fast.axis_trajectory,
         )
-        if output.slow is None:
-            return common
-        return common + (
-            output.slow.immediate_movement_logits,
-            output.slow.immediate_button_logits,
-            output.slow.trajectory_movement_logits,
-            output.slow.trajectory_button_logits,
-        )
+        return common
 
 
 VIDEO_INPUT_NAMES = [
@@ -538,6 +554,24 @@ class FastPath(nn.Module):
         )
 
 
+class SlowPath(nn.Module):
+    """Standalone slow decoder so discrete control follows the fast-tick phase."""
+
+    def __init__(self, model: HierarchicalImitationController) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, shared_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        prediction = self.model.slow_decoder(shared_tokens)
+        return (
+            prediction.immediate_movement_logits,
+            prediction.immediate_button_logits,
+            self.model._slow_trajectory(prediction),
+        )
+
+
 def _example_video_inputs(
     cfg: ModelConfig, dtype: torch.dtype
 ) -> tuple[torch.Tensor, ...]:
@@ -576,7 +610,7 @@ def _export_onnx(
         import onnxscript  # pyright: ignore[reportMissingImports]  # noqa: F401
     except ImportError as error:
         raise RuntimeError(
-            "install the rtx dependency group before exporting ONNX"
+            "required ONNX dependencies are missing; reinstall the project"
         ) from error
     module.eval()
     torch.onnx.export(
@@ -615,15 +649,6 @@ def export_rtx_artifact(
     for variant in ("ordinary", "intermediate", "long"):
         graph_path = output_dir / f"video_{variant}.onnx"
         output_names = list(VIDEO_COMMON_OUTPUT_NAMES)
-        if variant != "ordinary":
-            output_names.extend(
-                (
-                    "immediate_movement_logits",
-                    "immediate_button_logits",
-                    "trajectory_movement_logits",
-                    "trajectory_button_logits",
-                )
-            )
         _export_onnx(
             VideoPath(model, variant),
             video_inputs,
@@ -664,6 +689,19 @@ def export_rtx_artifact(
         ],
     )
     graphs["fast_tick"] = {"onnx": fast_path.name}
+    slow_path = output_dir / "slow_tick.onnx"
+    _export_onnx(
+        SlowPath(model),
+        (torch.zeros(1, cfg.control_query_tokens, cfg.model_dim, dtype=torch.float16),),
+        slow_path,
+        ["shared_tokens"],
+        [
+            "immediate_movement_logits",
+            "immediate_button_logits",
+            "next_previous_slow_trajectory",
+        ],
+    )
+    graphs["slow_tick"] = {"onnx": slow_path.name}
     artifact = {
         "artifact_version": ARTIFACT_VERSION,
         "checkpoint_format": 3,
@@ -790,7 +828,13 @@ def _load_artifact(artifact_dir: Path) -> dict[str, Any]:
         "required_compute_capability"
     ) != list(RTX_COMPUTE_CAPABILITY):
         raise ValueError("artifact is not locked to an RTX 4080 SM89")
-    for name in ("video_ordinary", "video_intermediate", "video_long", "fast_tick"):
+    for name in (
+        "video_ordinary",
+        "video_intermediate",
+        "video_long",
+        "fast_tick",
+        "slow_tick",
+    ):
         graph = manifest.get("graphs", {}).get(name)
         if not isinstance(graph, dict) or not graph.get("engine"):
             raise ValueError(f"artifact is missing built engine {name}")
@@ -812,11 +856,12 @@ def _update_timing(
     absolute_time: float,
     since_video: float,
     since_slow: float,
+    fast_hz: int,
 ) -> None:
     metadata["absolute_time"].fill_(absolute_time)
     metadata["since_video_frame"].fill_(since_video)
     metadata["since_slow_update"].fill_(since_slow)
-    metadata["fast_delta_time"].fill_(1.0 / 60.0)
+    metadata["fast_delta_time"].fill_(1.0 / fast_hz)
 
 
 def _update_telemetry(
@@ -1042,6 +1087,7 @@ def benchmark_main() -> None:
                 tick_start - start,
                 tick_start - last_video,
                 tick_start - last_slow,
+                cfg.fast_hz,
             )
             if tick % cfg.fast_ticks_per_slow == 0:
                 _update_telemetry(metadata, telemetry, tick_start)
@@ -1212,7 +1258,13 @@ def run_main() -> None:
                 frame_gpu.copy_(frame_host, non_blocking=True)
                 video_frame = frame_gpu
                 last_video = now
-            _update_timing(metadata, now - start, now - last_video, now - last_slow)
+            _update_timing(
+                metadata,
+                now - start,
+                now - last_video,
+                now - last_slow,
+                cfg.fast_hz,
+            )
             if tick % cfg.fast_ticks_per_slow == 0:
                 _update_telemetry(metadata, telemetry, now)
             axes, movement, buttons = controller.step(tick, metadata, video_frame)

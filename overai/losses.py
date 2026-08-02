@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch.nn import functional as F
@@ -23,6 +24,7 @@ class LossWeights:
     immediate_consistency: float = 0.25
 
 
+@lru_cache(maxsize=32)
 def horizon_weights(
     horizon: int,
     device: torch.device,
@@ -30,6 +32,8 @@ def horizon_weights(
     minimum_weight: float = 0.15,
     decay: float = 3.0,
 ) -> torch.Tensor:
+    """Return shared, read-only horizon weights for a training configuration."""
+
     normalized_time = torch.linspace(0.0, 1.0, horizon, device=device, dtype=dtype)
     weights = minimum_weight + (1.0 - minimum_weight) * torch.exp(
         -decay * normalized_time
