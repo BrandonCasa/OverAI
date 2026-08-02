@@ -1,0 +1,29 @@
+{
+  "window": {
+    "process_name": "Overwatch.exe",
+    "title_regex": "^Overwatch Application(?:$| - )"
+  },
+  "movement": {
+    "left": "A",
+    "right": "D",
+    "forward": "W",
+    "reverse": "S"
+  },
+  "buttons": [
+    "MOUSE1",
+    "MOUSE2",
+    "MOUSE5",
+    "SPACE",
+    "SHIFT",
+    "E",
+    "R",
+    "Q"
+  ],
+  "pause_key": "F8",
+  "emergency_stop_key": "F9",
+  "invert_axes": [
+    false,
+    false
+  ],
+  "telemetry_provider": "zero"
+}

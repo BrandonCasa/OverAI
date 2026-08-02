@@ -45,10 +45,10 @@ foreach ($tool in @("cmake", "ninja", "cl")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is required but was not found after toolchain setup." }
 }
 
-$env:UV_PROJECT_ENVIRONMENT = ".venv-rtx"
+$env:UV_PROJECT_ENVIRONMENT = ".venv"
 uv sync --python 3.13 --group recording --group rtx --group dev
 
-& .venv-rtx\Scripts\python.exe -c @'
+& .venv\Scripts\python.exe -c @'
 import torch
 import tensorrt_rtx as trt
 

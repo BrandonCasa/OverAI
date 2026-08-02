@@ -142,9 +142,9 @@ and failure-policy settings, and finalized dataset manifests retain the telemetr
 configuration hash and similarity formula.
 
 ```powershell
-.venv-rtx\Scripts\overai-record.exe --profile configs\my-profile.json --split train --episode-id run-001 --output D:\overai\train
-.venv-rtx\Scripts\overai-record.exe --profile configs\my-profile.json --split validation --episode-id val-001 --output D:\overai\validation
-.venv-rtx\Scripts\overai-finalize-dataset.exe --train D:\overai\train --validation D:\overai\validation
+.venv\Scripts\overai-record.exe --profile configs\my-profile.json --split train --episode-id run-001 --output D:\overai\train
+.venv\Scripts\overai-record.exe --profile configs\my-profile.json --split validation --episode-id val-001 --output D:\overai\validation
+.venv\Scripts\overai-finalize-dataset.exe --train D:\overai\train --validation D:\overai\validation
 ```
 
 Focus loss, pause, emergency stop, timing gaps, resize/capture loss, or capture
@@ -197,9 +197,9 @@ strongly typed FP16 TensorRT-RTX engines: ordinary video, intermediate promotion
 long promotion, and between-frame fast tick.
 
 ```powershell
-.venv-rtx\Scripts\overai-export-rtx.exe --checkpoint runs\doom-h100\checkpoint_last.pt --output artifacts\doom-4080
-.venv-rtx\Scripts\overai-benchmark-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json --duration 600
-.venv-rtx\Scripts\overai-run-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json
+.venv\Scripts\overai-export-rtx.exe --checkpoint runs\doom-h100\checkpoint_last.pt --output artifacts\doom-4080
+.venv\Scripts\overai-benchmark-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json --duration 600
+.venv\Scripts\overai-run-rtx.exe --artifact artifacts\doom-4080 --profile configs\my-profile.json
 ```
 
 Exports keep LayerNorm and attention SDPA/softmax in FP16 by default. If trained-
