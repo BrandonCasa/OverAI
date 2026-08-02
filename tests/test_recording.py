@@ -13,6 +13,7 @@ import torch
 from torchvision.io import write_jpeg
 
 from overai.config import ModelConfig
+from overai.data import CONTROL_KEYS, load_manifest
 from overai.recording import (
     AxisDenormalizer,
     AxisNormalization,
@@ -521,6 +522,7 @@ class RecordingTests(unittest.TestCase):
                 root / "validation" / "episodes" / "validation-1" / "controls.pt",
                 weights_only=True,
             )
+            self.assertEqual(set(validation), set(CONTROL_KEYS))
             self.assertTrue(torch.all(validation["axes"].abs() <= 1))
             manifest = json.loads(
                 (root / "validation" / "validation.json").read_text(encoding="utf-8")
@@ -532,6 +534,11 @@ class RecordingTests(unittest.TestCase):
             self.assertNotIn("telemetry", manifest)
             self.assertEqual(manifest["version"], 3)
             self.assertEqual(manifest["num_buttons"], 11)
+            records = load_manifest(
+                root / "validation" / "validation.json",
+                replace(ModelConfig.tiny(), num_buttons=11),
+            )
+            self.assertEqual(len(records), 1)
 
 
 if __name__ == "__main__":

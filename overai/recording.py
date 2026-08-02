@@ -20,6 +20,7 @@ import torch
 from torchvision.io import write_jpeg
 
 from .config import ModelConfig
+from .data import CONTROL_KEYS
 
 
 _ENCODER_STALL_BUDGET_SECONDS = 2.0
@@ -639,8 +640,9 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
             controls["axes"] = normalization.normalize(
                 controls["raw_mouse_deltas"], controls["fast_durations"]
             )
+            finalized_controls = {key: controls[key] for key in CONTROL_KEYS}
             temporary = controls_path.with_suffix(".pt.tmp")
-            torch.save(controls, temporary)
+            torch.save(finalized_controls, temporary)
             os.replace(temporary, controls_path)
             metadata["finalized"] = True
             metadata_temporary = episode / "episode.json.tmp"
