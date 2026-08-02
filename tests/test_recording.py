@@ -26,6 +26,7 @@ class _SyntheticBackend:
         self.fail_capture = fail_capture
         self.held_calls = 0
         self.stopped = False
+        self.frame_timeouts: list[int] = []
 
     def start(self) -> None:
         self.stopped = False
@@ -34,6 +35,7 @@ class _SyntheticBackend:
         self.stopped = True
 
     def latest_frame(self, timeout_ms: int):
+        self.frame_timeouts.append(timeout_ms)
         if self.fail_capture:
             return None
         return (
@@ -133,6 +135,7 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue((episode / "frames_r" / "000000.jpg").is_file())
             self.assertFalse(episode.with_name("paused-1.recording").exists())
             self.assertTrue(backend.stopped)
+            self.assertEqual(backend.frame_timeouts, [2000])
             metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["telemetry"]["provider"], "zero")
             self.assertEqual(metadata["telemetry"]["diagnostics"]["provider"], "zero")

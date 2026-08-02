@@ -114,6 +114,35 @@ class WNDCLASSW(ctypes.Structure):
     )
 
 
+# ctypes otherwise assumes ``c_int`` for every argument and return value.  In
+# particular, that changes HWND_MESSAGE (-3) into 0x00000000fffffffd on x64,
+# which CreateWindowExW rejects as an invalid parent window handle.
+user32.CreateWindowExW.argtypes = (
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.HMENU,
+    wintypes.HINSTANCE,
+    wintypes.LPVOID,
+)
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.RegisterClassW.argtypes = (ctypes.POINTER(WNDCLASSW),)
+user32.RegisterClassW.restype = wintypes.ATOM
+user32.DefWindowProcW.argtypes = (
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+
+
 def _raise_last_error(message: str) -> None:
     raise OSError(ctypes.get_last_error(), message)
 

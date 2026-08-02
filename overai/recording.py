@@ -352,7 +352,12 @@ class EpisodeRecorder:
                 fast_deltas.append(self.backend.drain_mouse_deltas(previous_fast, now))
                 previous_fast = now
                 if fast_index % self.cfg.fast_ticks_per_video == 0:
-                    captured = self.backend.latest_frame(timeout_ms=0)
+                    # Windows Graphics Capture begins on a background thread.  Give
+                    # its first frame a bounded startup window; later samples must
+                    # remain non-blocking to preserve the requested cadence.
+                    captured = self.backend.latest_frame(
+                        timeout_ms=2000 if frame_index == 0 else 0
+                    )
                     if captured is None:
                         if frame_index:
                             break
