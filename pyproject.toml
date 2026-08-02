@@ -15,6 +15,7 @@ dependencies = [
     "torchvision",
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
     "transformers",
+    "torchao>=0.17.0",
 ]
 
 [project.scripts]

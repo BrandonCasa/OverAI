@@ -234,6 +234,8 @@ def save_checkpoint(
     control_profile_sha256: str,
     telemetry: dict[str, Any],
     epoch_complete: bool,
+    batches_completed_in_epoch: int,
+    data_loader_generator_state: torch.Tensor,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -249,6 +251,10 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "epoch_complete": epoch_complete,
+            "batches_completed_in_epoch": batches_completed_in_epoch,
+            "data_loader_generator_state": data_loader_generator_state,
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
             "global_step": global_step,
         },
         temporary,
@@ -264,7 +270,7 @@ def load_checkpoint(
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
     telemetry: dict[str, Any],
-) -> tuple[int, int]:
+) -> tuple[int, int, int | None, torch.Tensor | None]:
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
     )
@@ -283,11 +289,49 @@ def load_checkpoint(
         raise ValueError("checkpoint telemetry configuration does not match dataset")
     model.load_state_dict(checkpoint_data["model"])
     optimizer.load_state_dict(checkpoint_data["optimizer"])
+    torch_rng_state = checkpoint_data.get("torch_rng_state")
+    if isinstance(torch_rng_state, torch.Tensor):
+        torch.set_rng_state(torch_rng_state)
+    cuda_rng_state_all = checkpoint_data.get("cuda_rng_state_all")
+    if isinstance(cuda_rng_state_all, list) and cuda_rng_state_all:
+        torch.cuda.set_rng_state_all(cuda_rng_state_all)
     checkpoint_epoch = int(checkpoint_data["epoch"])
-    resume_epoch = checkpoint_epoch + int(
-        bool(checkpoint_data.get("epoch_complete", False))
+    epoch_complete = bool(checkpoint_data.get("epoch_complete", False))
+    resume_epoch = checkpoint_epoch + int(epoch_complete)
+    batches_completed = (
+        0
+        if epoch_complete
+        else checkpoint_data.get("batches_completed_in_epoch")
     )
-    return resume_epoch, int(checkpoint_data["global_step"])
+    if batches_completed is not None:
+        batches_completed = int(batches_completed)
+    generator_state = checkpoint_data.get("data_loader_generator_state")
+    if generator_state is not None and not isinstance(generator_state, torch.Tensor):
+        raise TypeError("checkpoint data-loader generator state is invalid")
+    return (
+        resume_epoch,
+        int(checkpoint_data["global_step"]),
+        batches_completed,
+        generator_state,
+    )
+
+
+def _legacy_batches_completed_in_epoch(
+    global_step: int,
+    epoch: int,
+    batches_per_epoch: int,
+    optimizer_steps_per_batch: int,
+) -> int:
+    if global_step % optimizer_steps_per_batch:
+        raise ValueError(
+            "legacy checkpoint global step does not align with a completed batch"
+        )
+    completed = global_step // optimizer_steps_per_batch - epoch * batches_per_epoch
+    if not 0 <= completed <= batches_per_epoch:
+        raise ValueError(
+            "legacy checkpoint does not contain enough state for an exact resume"
+        )
+    return completed
 
 
 def _make_optimizer(
@@ -355,8 +399,14 @@ def run_training(
     optimizer = _make_optimizer(model, training_cfg, device)
     start_epoch = 0
     global_step = 0
+    resume_batches: int | None = 0
     if resume is not None:
-        start_epoch, global_step = load_checkpoint(
+        (
+            start_epoch,
+            global_step,
+            resume_batches,
+            generator_state,
+        ) = load_checkpoint(
             resume,
             model,
             optimizer,
@@ -364,6 +414,8 @@ def run_training(
             control_profile_sha256=control_profile_sha256,
             telemetry=telemetry,
         )
+        if generator_state is not None:
+            generator.set_state(generator_state)
     if training_cfg.compile_vision:
         if not hasattr(model.vision, "compile"):
             raise RuntimeError("this PyTorch build does not provide nn.Module.compile")
@@ -372,6 +424,17 @@ def run_training(
     tbptt_ticks = round(training_cfg.tbptt_seconds * model_cfg.fast_hz)
     if tbptt_ticks <= 0:
         raise ValueError("tbptt_seconds must span at least one fast tick")
+    optimizer_steps_per_batch = (
+        dataset.optimization_ticks + tbptt_ticks - 1
+    ) // tbptt_ticks
+    if resume is not None and resume_batches is None:
+        resume_batches = _legacy_batches_completed_in_epoch(
+            global_step,
+            start_epoch,
+            len(loader),
+            optimizer_steps_per_batch,
+        )
+    assert resume_batches is not None
     output_dir.mkdir(parents=True, exist_ok=True)
     model_cfg.to_json(output_dir / "model_config.json")
     (output_dir / "training_config.json").write_text(
@@ -387,9 +450,14 @@ def run_training(
 
     for epoch in range(start_epoch, training_cfg.epochs):
         epoch_start = time.perf_counter()
+        epoch_generator_state = generator.get_state()
         epoch_losses: list[float] = []
-        processed_batches = 0
+        skipped_batches = resume_batches if epoch == start_epoch else 0
+        processed_batches = skipped_batches
+        newly_processed_batches = 0
         for batch_index, batch in enumerate(loader):
+            if batch_index < skipped_batches:
+                continue
             result = train_sequence_batch(
                 model,
                 batch,
@@ -402,6 +470,7 @@ def run_training(
             global_step += result.optimizer_steps
             epoch_losses.append(result.mean_loss)
             processed_batches = batch_index + 1
+            newly_processed_batches += 1
             print(
                 f"epoch={epoch + 1}/{training_cfg.epochs} batch={batch_index + 1}/"
                 f"{len(loader)} step={global_step} loss={result.mean_loss:.5f}"
@@ -421,8 +490,13 @@ def run_training(
                     control_profile_sha256,
                     telemetry,
                     epoch_complete=False,
+                    batches_completed_in_epoch=processed_batches,
+                    data_loader_generator_state=epoch_generator_state,
                 )
-            if max_batches is not None and batch_index + 1 >= max_batches:
+            if (
+                max_batches is not None
+                and newly_processed_batches >= max_batches
+            ):
                 break
 
         mean_epoch_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -441,7 +515,14 @@ def run_training(
             control_profile_sha256,
             telemetry,
             epoch_complete=processed_batches == len(loader),
+            batches_completed_in_epoch=processed_batches,
+            data_loader_generator_state=(
+                generator.get_state()
+                if processed_batches == len(loader)
+                else epoch_generator_state
+            ),
         )
+        resume_batches = 0
 
 
 def build_parser() -> argparse.ArgumentParser:

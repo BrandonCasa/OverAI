@@ -12,6 +12,7 @@ from overai.model import HierarchicalImitationController
 from overai.synthetic import create_synthetic_dataset
 from overai.training import (
     TrainingConfig,
+    _legacy_batches_completed_in_epoch,
     load_checkpoint,
     save_checkpoint,
     train_sequence_batch,
@@ -119,7 +120,7 @@ class TrainingPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "complete video interval"):
                 dataset_summary(manifest, cfg)
 
-    def test_checkpoint_resume_repeats_partial_epoch_and_validates_calibration(self) -> None:
+    def test_checkpoint_resume_continues_partial_epoch_and_validates_calibration(self) -> None:
         cfg = ModelConfig.tiny()
         training_cfg = TrainingConfig(epochs=4, num_workers=0, bf16=False)
         axis_normalization = {
@@ -132,6 +133,7 @@ class TrainingPipelineTests(unittest.TestCase):
             checkpoint = Path(temporary) / "checkpoint.pt"
             source = HierarchicalImitationController(cfg)
             source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-4)
+            generator_state = torch.Generator().manual_seed(42).get_state()
             save_checkpoint(
                 checkpoint,
                 source,
@@ -143,20 +145,24 @@ class TrainingPipelineTests(unittest.TestCase):
                 control_profile_sha256="profile-a",
                 telemetry=telemetry,
                 epoch_complete=False,
+                batches_completed_in_epoch=7,
+                data_loader_generator_state=generator_state,
             )
             target = HierarchicalImitationController(cfg)
             target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-4)
-            self.assertEqual(
-                load_checkpoint(
-                    checkpoint,
-                    target,
-                    target_optimizer,
-                    axis_normalization=axis_normalization,
-                    control_profile_sha256="profile-a",
-                    telemetry=telemetry,
-                ),
-                (2, 17),
+            resume_state = load_checkpoint(
+                checkpoint,
+                target,
+                target_optimizer,
+                axis_normalization=axis_normalization,
+                control_profile_sha256="profile-a",
+                telemetry=telemetry,
             )
+            self.assertEqual(resume_state[:3], (2, 17, 7))
+            restored_generator_state = resume_state[3]
+            self.assertIsNotNone(restored_generator_state)
+            assert restored_generator_state is not None
+            self.assertTrue(torch.equal(restored_generator_state, generator_state))
 
             mismatches = (
                 ({**axis_normalization, "scale_counts_per_second": [1.0, 2.0]}, "profile-a", telemetry, "axis normalization"),
@@ -177,17 +183,32 @@ class TrainingPipelineTests(unittest.TestCase):
             payload = torch.load(checkpoint, weights_only=True)
             payload["epoch_complete"] = True
             torch.save(payload, checkpoint)
-            self.assertEqual(
-                load_checkpoint(
-                    checkpoint,
-                    target,
-                    target_optimizer,
-                    axis_normalization=axis_normalization,
-                    control_profile_sha256="profile-a",
-                    telemetry=telemetry,
-                ),
-                (3, 17),
+            resume_state = load_checkpoint(
+                checkpoint,
+                target,
+                target_optimizer,
+                axis_normalization=axis_normalization,
+                control_profile_sha256="profile-a",
+                telemetry=telemetry,
             )
+            self.assertEqual(resume_state[:3], (3, 17, 0))
+            restored_generator_state = resume_state[3]
+            self.assertIsNotNone(restored_generator_state)
+            assert restored_generator_state is not None
+            self.assertTrue(torch.equal(restored_generator_state, generator_state))
+
+    def test_legacy_partial_checkpoint_batch_position_is_recovered(self) -> None:
+        self.assertEqual(
+            _legacy_batches_completed_in_epoch(
+                global_step=240,
+                epoch=0,
+                batches_per_epoch=51,
+                optimizer_steps_per_batch=20,
+            ),
+            12,
+        )
+        with self.assertRaisesRegex(ValueError, "completed batch"):
+            _legacy_batches_completed_in_epoch(241, 0, 51, 20)
 
 
 if __name__ == "__main__":
