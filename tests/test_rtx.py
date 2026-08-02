@@ -86,6 +86,20 @@ def _metadata() -> dict[str, torch.Tensor]:
 
 
 class RtxSchedulingTests(unittest.TestCase):
+    def test_graph_metadata_has_no_hud_inputs(self) -> None:
+        self.assertEqual(
+            METADATA_INPUT_NAMES,
+            [
+                "movement",
+                "buttons",
+                "executed_axes",
+                "absolute_time",
+                "since_video_frame",
+                "since_slow_update",
+                "fast_delta_time",
+            ],
+        )
+
     def test_memory_and_discrete_schedules_use_independent_configured_phases(self) -> None:
         cfg = ModelConfig.tiny()
         controller, calls = _fake_controller(cfg)

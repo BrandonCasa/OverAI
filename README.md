@@ -20,13 +20,13 @@ The default model is the uploaded specification:
 The repository includes the two-channel model, streaming state, memory promotion logic,
 rate-derived runtime scheduler, direct and horizon imitation losses, safe dataset
 validation, incremental JPEG/PNG decoding, truncated backpropagation through time,
-bfloat16 CUDA training, format-3 atomic checkpoints, Windows Graphics Capture and
+bfloat16 CUDA training, format-4 atomic checkpoints, Windows Graphics Capture and
 Raw Input recording, dataset finalization with training-only axis calibration,
 fixed-shape ONNX/TensorRT-RTX export, a 60 Hz RTX scheduler, SendInput control,
 latency gates, and deterministic end-to-end tests.
 
 Game integration is deliberately an adapter rather than hard-coded DOOM logic.
-Each game exposes its screen, available telemetry, and input mapping differently.
+Each game exposes its screen and input mapping differently.
 Implement `overai.runtime.GameAdapter` for the target executable, then use
 `run_realtime`. Keep training and deployment mappings identical. Use this only in
 offline or private-LAN games where automation is permitted.
@@ -73,7 +73,7 @@ can be split by whole episode (never by overlapping windows):
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "split": "train",
   "channels": ["R", "B"],
   "axis_normalization": {
@@ -102,19 +102,12 @@ R and B are paired zero-padded grayscale JPEGs (quality 95) sampled at 30 Hz. Th
 | `slow_timestamps` | `[T_slow]` | 5 Hz | Discrete-control time |
 | `raw_mouse_deltas` | `[T_fast, 2]` | 60 Hz | Integer Raw Input relative counts |
 | `fast_durations` | `[T_fast]` | 60 Hz | Exact bin duration in seconds |
-| `health` | `[T_slow, 1]` | 5 Hz | Normalized context |
-| `damage_events` | `[T_slow, 1]` | 5 Hz | Binary event |
-| `kill_events` | `[T_slow, 1]` | 5 Hz | Binary event |
-| `charge` | `[T_slow, 1]` | 5 Hz | Normalized context |
 | `axes` | `[T_fast, 2]` | 60 Hz | Executed values in `[-1, 1]` |
 | `movement` | `[T_slow, 2]` | 5 Hz | X: `LEFT=0, NONE=1, RIGHT=2`; Y: `REVERSE=0, NONE=1, FORWARD=2` |
-| `buttons` | `[T_slow, 6]` | 5 Hz | Binary held states |
+| `buttons` | `[T_slow, num_buttons]` | 5 Hz | Binary held states |
 
-If a game cannot expose health, damage, kills, or charge, record zeros for that
-channel and also return zeros from the deployment adapter. Context is sampled at
-5 Hz and held across the intervening fast ticks. Do not infer future telemetry
-into an earlier timestamp. Record executed inputs, not merely requested inputs,
-so the action-history encoder sees what the game actually received.
+Record executed inputs, not merely requested inputs, so the action-history
+encoder sees what the game actually received.
 
 Before committing to a long GPU run, validate each split independently:
 
@@ -136,23 +129,9 @@ and reports the excluded count as `discarded_terminal_fast_ticks`.
 
 ## Windows recording and dataset finalization
 
-Copy `configs/windows_control_profile.example.json` for explicit zero telemetry, or
-`configs/windows_control_profile.hud.example.json` for HUD analysis. Set the
-required process, title regex, movement keys, and the same number of buttons as
-`num_buttons` in the model config,
-pause/emergency keys, and axis inversion. The HUD example's coordinates and
-colors are deliberately non-production placeholders: replace every bounding box,
-sample point, color, and maximum-health value from 1920x1080 reference captures.
-
-HUD analysis runs on each fresh 30 Hz BGRA surface before green is discarded for
-the model. Health and charge use configurable bitmap-glyph OCR with bounded stale
-retention. Four-point hitmarkers and seven-point kill markers use normalized RGB
-Euclidean similarity, debounce persistent HUD state, and remain latched until a
-5 Hz sample is written. The same bounded latest-frame worker supplies recording,
-benchmarking, and RTX inference; OCR never runs on the 60 Hz inference thread.
-The profile hash includes all OCR, coordinate, color, similarity, debounce, stale,
-and failure-policy settings, and finalized dataset manifests retain the telemetry
-configuration hash and similarity formula.
+Copy `configs/windows_control_profile.example.json`, then set the required
+process, title regex, movement keys, the same number of buttons as `num_buttons`
+in the model config, pause/emergency keys, and axis inversion.
 
 ```powershell
 .venv\Scripts\overai-record.exe --profile configs\my-profile.json --split train --episode-id run-001 --output D:\overai\train

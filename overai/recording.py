@@ -20,13 +20,6 @@ import torch
 from torchvision.io import write_jpeg
 
 from .config import ModelConfig
-from .telemetry import (
-    CapturedFrame,
-    HudTelemetryConfig,
-    TelemetryWorker,
-    coerce_captured_frame,
-    create_telemetry_worker,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,14 +36,26 @@ class ControlProfile:
     pause_key: str
     emergency_stop_key: str
     invert_axes: tuple[bool, bool] = (False, False)
-    telemetry_provider: str = "zero"
-    hud_telemetry: HudTelemetryConfig | None = None
 
     @classmethod
     def from_json(cls, path: str | Path) -> ControlProfile:
         payload: Any = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise TypeError("control profile must be a JSON object")
+        supported_fields = {
+            "window",
+            "movement",
+            "buttons",
+            "pause_key",
+            "emergency_stop_key",
+            "invert_axes",
+        }
+        unsupported_fields = sorted(set(payload) - supported_fields)
+        if unsupported_fields:
+            raise ValueError(
+                "control profile contains unsupported fields: "
+                + ", ".join(unsupported_fields)
+            )
         window = payload.get("window")
         if not isinstance(window, dict):
             raise TypeError("control profile window must be an object")
@@ -83,17 +88,6 @@ class ControlProfile:
             or any(not isinstance(value, bool) for value in invert_axes)
         ):
             raise ValueError("invert_axes must contain two booleans")
-        telemetry = payload.get("telemetry_provider", "zero")
-        if telemetry not in {"zero", "hud_telemetry"}:
-            raise ValueError("telemetry_provider must be zero or hud_telemetry")
-        hud_payload = payload.get("hud_telemetry")
-        hud_telemetry = (
-            HudTelemetryConfig.from_mapping(hud_payload)
-            if telemetry == "hud_telemetry"
-            else None
-        )
-        if telemetry == "zero" and hud_payload is not None:
-            raise ValueError("hud_telemetry configuration requires its provider")
         pause = payload.get("pause_key")
         emergency = payload.get("emergency_stop_key")
         if not isinstance(pause, str) or not pause:
@@ -107,19 +101,11 @@ class ControlProfile:
             pause_key=pause,
             emergency_stop_key=emergency,
             invert_axes=(invert_axes[0], invert_axes[1]),
-            telemetry_provider=telemetry,
-            hud_telemetry=hud_telemetry,
         )
 
     def sha256(self) -> str:
         canonical = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    def telemetry_manifest(self) -> dict[str, Any]:
-        if self.hud_telemetry is None:
-            return {"provider": "zero", "sha256": None}
-        return self.hud_telemetry.manifest()
-
 
 @dataclass(frozen=True, slots=True)
 class AxisNormalization:
@@ -232,7 +218,6 @@ class EpisodeRecorder:
         output_dir: Path,
         split: str,
         episode_id: str,
-        telemetry_worker: TelemetryWorker | None = None,
     ) -> None:
         if split not in {"train", "validation"}:
             raise ValueError("split must be train or validation")
@@ -244,7 +229,6 @@ class EpisodeRecorder:
         self.output_dir = output_dir
         self.split = split
         self.episode_id = episode_id
-        self.telemetry_worker = telemetry_worker
         if len(profile.buttons) != cfg.num_buttons:
             raise ValueError(
                 "control profile button count does not match model config: "
@@ -327,9 +311,6 @@ class EpisodeRecorder:
                 encode_error.append(
                     RuntimeError("JPEG encoder did not shut down within 30 seconds")
                 )
-        telemetry = self.telemetry_worker or create_telemetry_worker(
-            self.profile.telemetry_provider, self.profile.hud_telemetry
-        )
         fast_deltas: list[tuple[int, int]] = []
         fast_durations: list[float] = []
         fast_timestamps: list[float] = []
@@ -337,15 +318,10 @@ class EpisodeRecorder:
         slow_timestamps: list[float] = []
         movement: list[tuple[int, int]] = []
         buttons: list[list[int]] = []
-        contexts: list[tuple[float, float, float, float]] = []
-        telemetry.start()
         try:
             self.backend.start()
         except BaseException:
-            try:
-                telemetry.stop(drain=False)
-            finally:
-                finish_encoder()
+            finish_encoder()
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise
         maximum_ticks = (
@@ -353,21 +329,18 @@ class EpisodeRecorder:
             if duration_seconds is None
             else max(0, math.ceil(duration_seconds * self.cfg.fast_hz))
         )
-        initial_frame: CapturedFrame | None = None
+        initial_frame: tuple[float, torch.Tensor] | None = None
         if maximum_ticks is None or maximum_ticks > 0:
             try:
                 captured = self.backend.latest_frame(timeout_ms=2000)
                 if captured is None:
                     raise RuntimeError("no fresh Windows Graphics Capture frame")
-                initial_frame = coerce_captured_frame(captured)
+                initial_frame = captured
             except BaseException:
                 try:
                     self.backend.stop()
                 finally:
-                    try:
-                        telemetry.stop(drain=False)
-                    finally:
-                        finish_encoder()
+                    finish_encoder()
                     shutil.rmtree(temporary_dir, ignore_errors=True)
                 raise
             # The initial frame establishes readiness, not elapsed recording time.
@@ -378,7 +351,6 @@ class EpisodeRecorder:
         previous_fast = start
         frame_index = 0
         fast_index = 0
-        slow_index = 0
         capture_timeout_ms = max(1, math.ceil(1000 / self.cfg.video_hz))
         failure: BaseException | None = None
         try:
@@ -396,13 +368,6 @@ class EpisodeRecorder:
                 if self.profile.pause_key in held:
                     break
                 if now - deadline > 2.0 / self.cfg.fast_hz:
-                    break
-                failure_duration = (
-                    None
-                    if self.profile.hud_telemetry is None
-                    else self.profile.hud_telemetry.failure_termination_seconds
-                )
-                if telemetry.should_terminate(now, failure_duration):
                     break
                 fast_timestamps.append(now - start)
                 fast_durations.append(max(now - previous_fast, 1.0 / self.cfg.fast_hz))
@@ -423,29 +388,23 @@ class EpisodeRecorder:
                                 "no fresh Windows Graphics Capture frame within "
                                 f"{capture_timeout_ms} ms at video frame {frame_index}"
                             )
-                        captured_frame = coerce_captured_frame(captured)
-                    captured_at = (
-                        start if fast_index == 0 else captured_frame.timestamp
-                    )
-                    frame = captured_frame.model_channels
+                        captured_frame = captured
+                    captured_at, frame = captured_frame
+                    if fast_index == 0:
+                        captured_at = start
                     if tuple(frame.shape) != (
                         self.cfg.input_channels,
                         self.cfg.image_height,
                         self.cfg.image_width,
                     ) or frame.dtype != torch.uint8:
                         raise ValueError("native capture returned an invalid RB frame")
-                    telemetry.submit(captured_frame)
                     enqueue_frame(_EncodedFrame(frame_index, frame.cpu()))
                     frame_timestamps.append(captured_at - start)
                     frame_index += 1
                 if fast_index % self.cfg.fast_ticks_per_slow == 0:
                     movement.append(self._movement(held, self.profile.movement))
                     buttons.append([int(binding in held) for binding in self.profile.buttons])
-                    snapshot = telemetry.sample(now)
-                    contexts.append(snapshot.values())
-                    telemetry.acknowledge(snapshot)
                     slow_timestamps.append(now - start)
-                    slow_index += 1
                 fast_index += 1
                 if encode_error:
                     raise RuntimeError("JPEG encoder failed") from encode_error[0]
@@ -455,10 +414,7 @@ class EpisodeRecorder:
             try:
                 self.backend.stop()
             finally:
-                try:
-                    telemetry.stop()
-                finally:
-                    finish_encoder()
+                finish_encoder()
         if failure is not None:
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise failure
@@ -468,7 +424,6 @@ class EpisodeRecorder:
         if not fast_timestamps:
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise RuntimeError("recording produced no samples")
-        context_tensor = torch.tensor(contexts, dtype=torch.float32)
         controls = {
             "fast_timestamps": torch.tensor(fast_timestamps, dtype=torch.float64),
             "frame_timestamps": torch.tensor(frame_timestamps, dtype=torch.float64),
@@ -476,10 +431,6 @@ class EpisodeRecorder:
             "raw_mouse_deltas": torch.tensor(fast_deltas, dtype=torch.int32),
             "fast_durations": torch.tensor(fast_durations, dtype=torch.float32),
             "axes": torch.zeros(len(fast_deltas), 2),
-            "health": context_tensor[:, 0:1],
-            "damage_events": context_tensor[:, 1:2],
-            "kill_events": context_tensor[:, 2:3],
-            "charge": context_tensor[:, 3:4],
             "movement": torch.tensor(movement, dtype=torch.long),
             "buttons": torch.tensor(buttons, dtype=torch.uint8),
         }
@@ -488,10 +439,6 @@ class EpisodeRecorder:
             "id": self.episode_id,
             "split": self.split,
             "profile_sha256": self.profile.sha256(),
-            "telemetry": {
-                **self.profile.telemetry_manifest(),
-                "diagnostics": telemetry.diagnostics(),
-            },
             "finalized": False,
         }
         (temporary_dir / "episode.json").write_text(
@@ -532,15 +479,11 @@ def _validate_episode(
         "raw_mouse_deltas",
         "fast_durations",
         "axes",
-        "health",
-        "damage_events",
-        "kill_events",
-        "charge",
         "movement",
         "buttons",
     }
     if set(controls) != required:
-        raise ValueError(f"{episode}: controls keys do not match dataset format 2")
+        raise ValueError(f"{episode}: controls keys do not match dataset format 3")
     fast_count = int(controls["fast_timestamps"].shape[0])
     slow_count = int(controls["slow_timestamps"].shape[0])
     if fast_count <= 0 or len(red) != int(controls["frame_timestamps"].shape[0]):
@@ -559,11 +502,6 @@ def _validate_episode(
             f"{episode}: button count {buttons.shape[1]} does not match "
             f"dataset button count {expected_num_buttons}"
         )
-    for name in ("health", "damage_events", "kill_events", "charge"):
-        if controls[name].shape != (slow_count, 1):
-            raise ValueError(f"{episode}: {name} must have shape [T_slow, 1]")
-        if not torch.isfinite(controls[name]).all():
-            raise ValueError(f"{episode}: {name} must contain only finite values")
     for name in ("fast_timestamps", "frame_timestamps", "slow_timestamps"):
         values = controls[name]
         if not torch.isfinite(values).all() or (
@@ -621,22 +559,6 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
     }
     if len(profile_hashes) != 1:
         raise ValueError("all train and validation episodes must use one control profile")
-    telemetry_manifests = {
-        json.dumps(
-            {
-                key: value
-                for key, value in json.loads(
-                    (episode / "episode.json").read_text(encoding="utf-8")
-                ).get("telemetry", {"provider": "zero", "sha256": None}).items()
-                if key != "diagnostics"
-            },
-            sort_keys=True,
-        )
-        for episode in (*train_episodes, *validation_episodes)
-    }
-    if len(telemetry_manifests) != 1:
-        raise ValueError("all episodes must use one telemetry configuration")
-    telemetry_manifest = json.loads(next(iter(telemetry_manifests)))
     for root, split, episodes in (
         (train_path, "train", train_episodes),
         (validation_path, "validation", validation_episodes),
@@ -662,13 +584,12 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
             os.replace(metadata_temporary, episode / "episode.json")
             entries.append(_episode_entry(root, episode))
         manifest = {
-            "version": 2,
+            "version": 3,
             "split": split,
             "channels": ["R", "B"],
             "axis_normalization": normalization.to_manifest(),
             "num_buttons": num_buttons,
             "control_profile_sha256": next(iter(profile_hashes)),
-            "telemetry": telemetry_manifest,
             "episodes": entries,
         }
         temporary_manifest = root / f"{split}.json.tmp"

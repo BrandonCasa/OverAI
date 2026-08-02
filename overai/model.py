@@ -24,7 +24,6 @@ from .types import (
     FastControllerState,
     FastPrediction,
     HierarchicalMemoryState,
-    ObservationContext,
     ReplanOutput,
     RuntimeStepOutput,
     SlowPrediction,
@@ -120,25 +119,6 @@ class SpatialVisionEncoder(nn.Module):
             else:
                 grid = block(grid)
         return self.output_norm(self.output_projection(grid))
-
-
-class ObservationContextEncoder(nn.Module):
-    def __init__(self, cfg: ModelConfig) -> None:
-        super().__init__()
-        self.encoder = MLP(4, cfg.model_dim, cfg.model_dim, dropout=cfg.dropout)
-
-    def forward(self, context: ObservationContext) -> torch.Tensor:
-        return self.encoder(
-            torch.cat(
-                (
-                    context.health,
-                    context.damage_event,
-                    context.kill_event,
-                    context.charge,
-                ),
-                dim=-1,
-            )
-        )
 
 
 class ExecutedActionEncoder(nn.Module):
@@ -534,7 +514,6 @@ class HierarchicalImitationController(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.vision = SpatialVisionEncoder(cfg)
-        self.observation_encoder = ObservationContextEncoder(cfg)
         self.executed_action_encoder = ExecutedActionEncoder(cfg)
         self.time_encoder = FourierTimeEmbedding(4, cfg.model_dim, dropout=cfg.dropout)
         self.trajectory_encoder = PreviousTrajectoryEncoder(cfg)
@@ -573,12 +552,10 @@ class HierarchicalImitationController(nn.Module):
 
     def build_metadata_tokens(
         self,
-        observation_context: ObservationContext,
         executed_actions: ExecutedActions,
         timing: TimingContext,
         state: ControllerState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        context_embedding = self.observation_encoder(observation_context)
         action_embedding = self.executed_action_encoder(executed_actions)
         timing_embedding = self.time_encoder(
             torch.cat(
@@ -596,7 +573,6 @@ class HierarchicalImitationController(nn.Module):
         )
         scalar_tokens = torch.stack(
             (
-                context_embedding,
                 self.action_to_model(action_embedding),
                 timing_embedding,
             ),
@@ -621,7 +597,6 @@ class HierarchicalImitationController(nn.Module):
     def on_video_frame(
         self,
         frame: torch.Tensor,
-        observation_context: ObservationContext,
         executed_actions: ExecutedActions,
         timing: TimingContext,
         state: ControllerState,
@@ -629,7 +604,7 @@ class HierarchicalImitationController(nn.Module):
     ) -> ReplanOutput:
         current_grid = self.vision(frame)
         metadata, action_embedding, timing_embedding = self.build_metadata_tokens(
-            observation_context, executed_actions, timing, state
+            executed_actions, timing, state
         )
         memory_state = self.memory.update(current_grid, metadata, state.memory)
         memory_tokens, memory_padding_mask = self.memory.read_tokens(memory_state)
@@ -657,7 +632,6 @@ class HierarchicalImitationController(nn.Module):
 
     def fast_tick_between_frames(
         self,
-        observation_context: ObservationContext,
         executed_actions: ExecutedActions,
         timing: TimingContext,
         state: ControllerState,
@@ -667,7 +641,7 @@ class HierarchicalImitationController(nn.Module):
                 "a video frame must be processed before a frame-free fast tick"
             )
         _, action_embedding, timing_embedding = self.build_metadata_tokens(
-            observation_context, executed_actions, timing, state
+            executed_actions, timing, state
         )
         fast_prediction = self.fast_decoder(
             state.shared_tokens, action_embedding, timing_embedding, state.fast
@@ -717,7 +691,6 @@ class RuntimeController:
     def step(
         self,
         optional_new_frame: torch.Tensor | None,
-        observation_context: ObservationContext,
         executed_actions: ExecutedActions,
         timing: TimingContext,
         state: ControllerState,
@@ -726,7 +699,6 @@ class RuntimeController:
         if optional_new_frame is not None:
             output = self.model.on_video_frame(
                 optional_new_frame,
-                observation_context,
                 executed_actions,
                 timing,
                 state,
@@ -737,7 +709,7 @@ class RuntimeController:
             slow_prediction = output.slow
         else:
             fast_prediction, state = self.model.fast_tick_between_frames(
-                observation_context, executed_actions, timing, state
+                executed_actions, timing, state
             )
             slow_prediction = None
             if slow_due:

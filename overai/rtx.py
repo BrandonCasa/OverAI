@@ -25,19 +25,17 @@ from .recording import (
     ControlProfile,
     create_native_backend,
 )
-from .telemetry import TelemetryWorker, coerce_captured_frame, create_telemetry_worker
 from .types import (
     ControllerState,
     ExecutedActions,
     FastControllerState,
     HierarchicalMemoryState,
-    ObservationContext,
     TimingContext,
 )
 
 RTX_GPU_NAME = "NVIDIA GeForce RTX 4080"
 RTX_COMPUTE_CAPABILITY = (8, 9)
-ARTIFACT_VERSION = 2
+ARTIFACT_VERSION = 3
 
 
 def _torch_dtype(trt_dtype: Any) -> torch.dtype:
@@ -277,8 +275,8 @@ def _load_checkpoint(
     path: Path,
 ) -> tuple[HierarchicalImitationController, dict[str, Any]]:
     payload: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("format_version") != 3:
-        raise ValueError("RTX export requires a format-3 RB checkpoint")
+    if payload.get("format_version") != 4:
+        raise ValueError("RTX export requires a format-4 RB checkpoint")
     cfg = ModelConfig(**payload["model_config"])
     model = HierarchicalImitationController(cfg)
     model.load_state_dict(payload["model"])
@@ -291,10 +289,6 @@ def _metadata_inputs(
 ) -> tuple[torch.Tensor, ...]:
     one = lambda: torch.zeros(1, 1, dtype=dtype)
     return (
-        one(),  # health
-        one(),  # damage
-        one(),  # kill
-        one(),  # charge
         torch.ones(1, 2, dtype=torch.long),  # movement
         torch.zeros(1, cfg.num_buttons, dtype=dtype),  # buttons
         torch.zeros(1, 2, dtype=dtype),  # executed axes
@@ -306,10 +300,6 @@ def _metadata_inputs(
 
 
 METADATA_INPUT_NAMES = [
-    "health",
-    "damage_event",
-    "kill_event",
-    "charge",
     "movement",
     "buttons",
     "executed_axes",
@@ -322,11 +312,10 @@ METADATA_INPUT_NAMES = [
 
 def _typed_metadata(
     values: tuple[torch.Tensor, ...],
-) -> tuple[ObservationContext, ExecutedActions, TimingContext]:
+) -> tuple[ExecutedActions, TimingContext]:
     return (
-        ObservationContext(values[0], values[1], values[2], values[3]),
-        ExecutedActions(values[4], values[5], values[6]),
-        TimingContext(values[7], values[8], values[9], values[10]),
+        ExecutedActions(values[0], values[1], values[2]),
+        TimingContext(values[3], values[4], values[5], values[6]),
     )
 
 
@@ -345,10 +334,6 @@ class VideoPath(nn.Module):
     def forward(
         self,
         frame: torch.Tensor,
-        health: torch.Tensor,
-        damage_event: torch.Tensor,
-        kill_event: torch.Tensor,
-        charge: torch.Tensor,
         movement: torch.Tensor,
         buttons: torch.Tensor,
         executed_axes: torch.Tensor,
@@ -369,10 +354,6 @@ class VideoPath(nn.Module):
     ) -> tuple[torch.Tensor, ...]:
         metadata = _typed_metadata(
             (
-                health,
-                damage_event,
-                kill_event,
-                charge,
                 movement,
                 buttons,
                 executed_axes,
@@ -415,7 +396,6 @@ class VideoPath(nn.Module):
             frame,
             metadata[0],
             metadata[1],
-            metadata[2],
             state,
             run_slow_decoder=False,
         )
@@ -478,10 +458,6 @@ class FastPath(nn.Module):
 
     def forward(
         self,
-        health: torch.Tensor,
-        damage_event: torch.Tensor,
-        kill_event: torch.Tensor,
-        charge: torch.Tensor,
         movement: torch.Tensor,
         buttons: torch.Tensor,
         executed_axes: torch.Tensor,
@@ -495,12 +471,8 @@ class FastPath(nn.Module):
         previous_axis_trajectory: torch.Tensor,
         previous_slow_trajectory: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        context, actions, timing = _typed_metadata(
+        actions, timing = _typed_metadata(
             (
-                health,
-                damage_event,
-                kill_event,
-                charge,
                 movement,
                 buttons,
                 executed_axes,
@@ -510,7 +482,6 @@ class FastPath(nn.Module):
                 fast_delta_time,
             )
         )
-        context_embedding = self.model.observation_encoder(context)
         action_embedding = self.model.executed_action_encoder(actions)
         timing_embedding = self.model.time_encoder(
             torch.cat(
@@ -530,7 +501,6 @@ class FastPath(nn.Module):
             (
                 torch.stack(
                     (
-                        context_embedding,
                         self.model.action_to_model(action_embedding),
                         timing_embedding,
                     ),
@@ -704,7 +674,7 @@ def export_rtx_artifact(
     graphs["slow_tick"] = {"onnx": slow_path.name}
     artifact = {
         "artifact_version": ARTIFACT_VERSION,
-        "checkpoint_format": 3,
+        "checkpoint_format": 4,
         "checkpoint_sha256": _checkpoint_sha256(checkpoint),
         "model_config": cfg.to_dict(),
         "training_config": payload.get("training_config"),
@@ -720,10 +690,6 @@ def export_rtx_artifact(
         "channels": ["R", "B"],
         "axis_normalization": payload.get("axis_normalization"),
         "control_profile_sha256": payload.get("control_profile_sha256"),
-        # Every format-3 checkpoint predating this field used zero telemetry.
-        "telemetry": payload.get(
-            "telemetry", {"provider": "zero", "sha256": None}
-        ),
         "required_gpu": RTX_GPU_NAME,
         "required_compute_capability": list(RTX_COMPUTE_CAPABILITY),
         "graphs": graphs,
@@ -814,16 +780,6 @@ def _load_artifact(artifact_dir: Path) -> dict[str, Any]:
         raise ValueError("unsupported RTX artifact version")
     if manifest.get("channels") != ["R", "B"]:
         raise ValueError("RTX artifact must use R/B input channels")
-    telemetry = manifest.get("telemetry")
-    if telemetry is None:
-        # Artifact-v1 exports made before HUD support could only use zeros.
-        telemetry = {"provider": "zero", "sha256": None}
-        manifest["telemetry"] = telemetry
-    if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
-        "zero",
-        "hud_telemetry",
-    }:
-        raise ValueError("RTX artifact is missing telemetry configuration")
     if manifest.get("required_gpu") != RTX_GPU_NAME or manifest.get(
         "required_compute_capability"
     ) != list(RTX_COMPUTE_CAPABILITY):
@@ -862,19 +818,6 @@ def _update_timing(
     metadata["since_video_frame"].fill_(since_video)
     metadata["since_slow_update"].fill_(since_slow)
     metadata["fast_delta_time"].fill_(1.0 / fast_hz)
-
-
-def _update_telemetry(
-    metadata: dict[str, torch.Tensor], worker: TelemetryWorker, timestamp: float
-) -> None:
-    """Write one causal 5 Hz sample, then clear only the represented latches."""
-
-    snapshot = worker.sample(timestamp)
-    metadata["health"].fill_(snapshot.health)
-    metadata["damage_event"].fill_(snapshot.damage_event)
-    metadata["kill_event"].fill_(snapshot.kill_event)
-    metadata["charge"].fill_(snapshot.charge)
-    worker.acknowledge(snapshot)
 
 
 class _HighResolutionTimer:
@@ -995,16 +938,11 @@ def benchmark_main() -> None:
         raise RuntimeError(
             "control profile does not match the artifact training profile"
         )
-    if artifact.get("telemetry") != profile.telemetry_manifest():
-        raise RuntimeError("telemetry configuration does not match the artifact")
     cfg = ModelConfig(**artifact["model_config"])
     device = torch.device("cuda:0")
     controller = Rtx4080Controller(args.artifact, device)
     metadata = _runtime_metadata(cfg, device)
     backend = create_native_backend(args.profile, cfg)
-    telemetry = create_telemetry_worker(
-        profile.telemetry_provider, profile.hud_telemetry
-    )
     frame_host = torch.empty(
         (1, cfg.input_channels, cfg.image_height, cfg.image_width),
         dtype=torch.uint8,
@@ -1026,20 +964,17 @@ def benchmark_main() -> None:
     torch.cuda.reset_peak_memory_stats(device)
     gpu_telemetry_start = _gpu_telemetry()
     timer = _HighResolutionTimer()
-    telemetry.start()
     try:
         backend.start()
     except BaseException:
-        telemetry.stop(drain=False)
         timer.close()
         raise
     try:
         initial = backend.latest_frame(timeout_ms=2000)
         if initial is None:
             raise RuntimeError("Windows Graphics Capture produced no initial frame")
-        initial_frame = coerce_captured_frame(initial)
-        telemetry.submit(initial_frame)
-        captured_at, frame = initial_frame.timestamp, initial_frame.model_channels
+        initial_frame = initial
+        captured_at, frame = initial_frame
         frame_host[0].copy_(frame)
         frame_gpu.copy_(frame_host, non_blocking=True)
         torch.cuda.synchronize(device)
@@ -1054,13 +989,6 @@ def benchmark_main() -> None:
             if backend.emergency_stop_requested() or not backend.target_active():
                 raise RuntimeError("benchmark stopped because focus or target was lost")
             tick_start = time.perf_counter()
-            failure_duration = (
-                None
-                if profile.hud_telemetry is None
-                else profile.hud_telemetry.failure_termination_seconds
-            )
-            if telemetry.should_terminate(tick_start, failure_duration):
-                raise RuntimeError("benchmark stopped after sustained telemetry failure")
             video_frame: torch.Tensor | None = None
             latest: Any = None
             if tick % cfg.fast_ticks_per_video == 0:
@@ -1068,13 +996,7 @@ def benchmark_main() -> None:
                 if latest is None:
                     capture_stalls += 1
                 else:
-                    captured_frame = coerce_captured_frame(latest)
-                    captured_at, frame = (
-                        captured_frame.timestamp,
-                        captured_frame.model_channels,
-                    )
-                    if tick != 0:
-                        telemetry.submit(captured_frame)
+                    captured_at, frame = latest
                     frame_host[0].copy_(frame)
                     transfer_start.record()
                     frame_gpu.copy_(frame_host, non_blocking=True)
@@ -1089,8 +1011,6 @@ def benchmark_main() -> None:
                 tick_start - last_slow,
                 cfg.fast_hz,
             )
-            if tick % cfg.fast_ticks_per_slow == 0:
-                _update_telemetry(metadata, telemetry, tick_start)
             engine_start.record()
             axes, movement, buttons = controller.step(tick, metadata, video_frame)
             metadata["executed_axes"].copy_(axes)
@@ -1117,7 +1037,6 @@ def benchmark_main() -> None:
         try:
             backend.stop()
         finally:
-            telemetry.stop()
             timer.close()
     values = torch.tensor(latencies, dtype=torch.float64)
     report = {
@@ -1153,7 +1072,6 @@ def benchmark_main() -> None:
         "peak_inference_vram_bytes": torch.cuda.max_memory_allocated(device),
         "gpu_telemetry_start": gpu_telemetry_start,
         "gpu_telemetry_end": _gpu_telemetry(),
-        "hud_telemetry": telemetry.diagnostics(),
     }
     print(json.dumps(report, indent=2))
     if (
@@ -1178,8 +1096,6 @@ def run_main() -> None:
         raise RuntimeError(
             "control profile does not match the artifact training profile"
         )
-    if artifact.get("telemetry") != profile.telemetry_manifest():
-        raise RuntimeError("telemetry configuration does not match the artifact")
     normalization = _normalization_from_artifact(artifact)
     cfg = ModelConfig(**artifact["model_config"])
     device = torch.device("cuda:0")
@@ -1187,9 +1103,6 @@ def run_main() -> None:
     metadata = _runtime_metadata(cfg, device)
     denormalizer = AxisDenormalizer(normalization, profile.invert_axes)
     backend = create_native_backend(args.profile, cfg)
-    telemetry = create_telemetry_worker(
-        profile.telemetry_provider, profile.hud_telemetry
-    )
     if not all(
         hasattr(backend, method)
         for method in ("apply_relative_mouse", "apply_discrete", "release_all")
@@ -1203,11 +1116,9 @@ def run_main() -> None:
     frame_gpu = torch.empty_like(frame_host, device=device)
     axes_host = torch.empty((1, 2), dtype=torch.float16, pin_memory=True)
     timer = _HighResolutionTimer()
-    telemetry.start()
     try:
         backend.start()
     except BaseException:
-        telemetry.stop(drain=False)
         timer.close()
         raise
     start = time.perf_counter()
@@ -1217,9 +1128,8 @@ def run_main() -> None:
         initial = backend.latest_frame(timeout_ms=2000)
         if initial is None:
             raise RuntimeError("Windows Graphics Capture produced no initial frame")
-        initial_frame = coerce_captured_frame(initial)
-        telemetry.submit(initial_frame)
-        first_frame = initial_frame.model_channels
+        initial_frame = initial
+        _, first_frame = initial_frame
         frame_host[0].copy_(first_frame)
         frame_gpu.copy_(frame_host, non_blocking=True)
         torch.cuda.synchronize(device)
@@ -1234,13 +1144,6 @@ def run_main() -> None:
                 or profile.pause_key in held
             ):
                 break
-            failure_duration = (
-                None
-                if profile.hud_telemetry is None
-                else profile.hud_telemetry.failure_termination_seconds
-            )
-            if telemetry.should_terminate(now, failure_duration):
-                break
             video_frame: torch.Tensor | None = None
             if tick % cfg.fast_ticks_per_video == 0:
                 latest = (
@@ -1250,10 +1153,7 @@ def run_main() -> None:
                 )
                 if latest is None:
                     break
-                captured_frame = coerce_captured_frame(latest)
-                frame = captured_frame.model_channels
-                if tick != 0:
-                    telemetry.submit(captured_frame)
+                _, frame = latest
                 frame_host[0].copy_(frame)
                 frame_gpu.copy_(frame_host, non_blocking=True)
                 video_frame = frame_gpu
@@ -1265,8 +1165,6 @@ def run_main() -> None:
                 now - last_slow,
                 cfg.fast_hz,
             )
-            if tick % cfg.fast_ticks_per_slow == 0:
-                _update_telemetry(metadata, telemetry, now)
             axes, movement, buttons = controller.step(tick, metadata, video_frame)
             axes_host.copy_(axes, non_blocking=True)
             torch.cuda.synchronize(device)
@@ -1293,5 +1191,4 @@ def run_main() -> None:
             try:
                 backend.stop()
             finally:
-                telemetry.stop()
                 timer.close()

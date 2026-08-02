@@ -14,7 +14,6 @@ from overai.model import (
 from overai.types import (
     ExecutedActions,
     FastTargets,
-    ObservationContext,
     SlowTargets,
     TimingContext,
 )
@@ -25,12 +24,6 @@ class ControllerTests(unittest.TestCase):
         torch.manual_seed(7)
         self.cfg = ModelConfig.tiny()
         self.model = HierarchicalImitationController(self.cfg)
-        self.context = ObservationContext(
-            health=torch.zeros(1, 1),
-            damage_event=torch.zeros(1, 1),
-            kill_event=torch.zeros(1, 1),
-            charge=torch.zeros(1, 1),
-        )
         self.actions = ExecutedActions(
             movement=torch.ones(1, 2, dtype=torch.long),
             buttons=torch.zeros(1, self.cfg.num_buttons),
@@ -53,7 +46,6 @@ class ControllerTests(unittest.TestCase):
         )
         output = self.model.on_video_frame(
             frame,
-            self.context,
             self.actions,
             self.timing,
             state,
@@ -107,7 +99,6 @@ class ControllerTests(unittest.TestCase):
         for _ in range(4):
             output = self.model.on_video_frame(
                 frame,
-                self.context,
                 self.actions,
                 self.timing,
                 state,
@@ -128,10 +119,10 @@ class ControllerTests(unittest.TestCase):
             self.cfg.image_width,
             dtype=torch.uint8,
         )
-        first = scheduler.step(frame, self.context, self.actions, self.timing, state)
+        first = scheduler.step(frame, self.actions, self.timing, state)
         self.assertIsNotNone(first.discrete)
         second = scheduler.step(
-            None, self.context, self.actions, self.timing, first.state
+            None, self.actions, self.timing, first.state
         )
         self.assertIsNone(second.discrete)
 

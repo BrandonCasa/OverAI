@@ -24,6 +24,5 @@
   "invert_axes": [
     false,
     false
-  ],
-  "telemetry_provider": "zero"
+  ]
 }

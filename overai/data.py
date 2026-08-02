@@ -20,17 +20,12 @@ from torch.utils.data import Dataset
 from torchvision.io import ImageReadMode, decode_image
 
 from .config import ModelConfig
-from .telemetry import SIMILARITY_FORMULA, SIMILARITY_METRIC
-from .types import ExecutedActions, ObservationContext, TimingContext
+from .types import ExecutedActions, TimingContext
 
 CONTROL_KEYS = (
     "fast_timestamps",
     "frame_timestamps",
     "slow_timestamps",
-    "health",
-    "damage_events",
-    "kill_events",
-    "charge",
     "axes",
     "movement",
     "buttons",
@@ -54,10 +49,6 @@ class SequenceBatch:
     fast_timestamps: torch.Tensor
     frame_timestamps: torch.Tensor
     slow_timestamps: torch.Tensor
-    health: torch.Tensor
-    damage_events: torch.Tensor
-    kill_events: torch.Tensor
-    charge: torch.Tensor
     axes: torch.Tensor
     movement: torch.Tensor
     buttons: torch.Tensor
@@ -94,17 +85,6 @@ class SequenceBatch:
                     f"decoded frame has shape {tuple(frame.shape)}, expected {expected}"
                 )
         return torch.stack(frames).to(device=device, non_blocking=True)
-
-    def observation_context(
-        self, tick: int, device: torch.device
-    ) -> ObservationContext:
-        slow_tick = tick // self.fast_ticks_per_slow
-        return ObservationContext(
-            health=self.health[:, slow_tick].to(device, non_blocking=True),
-            damage_event=self.damage_events[:, slow_tick].to(device, non_blocking=True),
-            kill_event=self.kill_events[:, slow_tick].to(device, non_blocking=True),
-            charge=self.charge[:, slow_tick].to(device, non_blocking=True),
-        )
 
     def executed_actions(self, tick: int, device: torch.device) -> ExecutedActions:
         previous_fast = max(tick - 1, 0)
@@ -166,6 +146,9 @@ def _load_controls_cached(
     missing = [key for key in CONTROL_KEYS if key not in loaded]
     if missing:
         raise ValueError(f"{path} is missing controls: {', '.join(missing)}")
+    unexpected = [key for key in loaded if key not in CONTROL_KEYS]
+    if unexpected:
+        raise ValueError(f"{path} contains unexpected controls: {', '.join(unexpected)}")
     controls: dict[str, torch.Tensor] = {}
     for key in CONTROL_KEYS:
         value = loaded[key]
@@ -189,10 +172,6 @@ def _validate_controls(
     }
     expected_slow_shapes = {
         "slow_timestamps": (slow_count,),
-        "health": (slow_count, 1),
-        "damage_events": (slow_count, 1),
-        "kill_events": (slow_count, 1),
-        "charge": (slow_count, 1),
         "movement": (slow_count, 2),
         "buttons": (slow_count, cfg.num_buttons),
     }
@@ -248,9 +227,6 @@ def _validate_controls(
         raise ValueError(f"{path}: movement must contain integer classes 0, 1, or 2")
     if not torch.isfinite(controls["axes"]).all():
         raise ValueError(f"{path}: axes contains non-finite values")
-    for key in ("health", "damage_events", "kill_events", "charge"):
-        if not torch.isfinite(controls[key]).all():
-            raise ValueError(f"{path}: {key} contains non-finite values")
     if controls["axes"].abs().max() > 1.0001:
         raise ValueError(f"{path}: axes must be normalized to [-1, 1]")
     buttons = controls["buttons"]
@@ -264,8 +240,8 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
     data: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise TypeError("dataset manifest must be an object")
-    if data.get("version") != 2:
-        raise ValueError("dataset manifest must have version 2")
+    if data.get("version") != 3:
+        raise ValueError("dataset manifest must have version 3")
     if data.get("channels") != ["R", "B"]:
         raise ValueError("dataset manifest channels must be ['R', 'B']")
     if data.get("split") not in {"train", "validation"}:
@@ -273,20 +249,6 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
     profile_hash = data.get("control_profile_sha256")
     if not isinstance(profile_hash, str) or not profile_hash:
         raise ValueError("dataset manifest must contain a control profile hash")
-    # Format-2 manifests created before HUD support could only contain zeros.
-    telemetry = data.get("telemetry", {"provider": "zero", "sha256": None})
-    if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
-        "zero",
-        "hud_telemetry",
-    }:
-        raise ValueError("dataset manifest must contain a telemetry configuration")
-    if telemetry.get("provider") == "hud_telemetry":
-        if not isinstance(telemetry.get("sha256"), str) or not telemetry["sha256"]:
-            raise ValueError("HUD telemetry manifest must contain its configuration hash")
-        if telemetry.get("similarity_metric") != SIMILARITY_METRIC or telemetry.get(
-            "similarity_formula"
-        ) != SIMILARITY_FORMULA:
-            raise ValueError("HUD telemetry manifest uses an unsupported color metric")
     normalization = data.get("axis_normalization")
     if not isinstance(normalization, dict):
         raise TypeError("dataset manifest axis_normalization must be an object")
@@ -455,10 +417,6 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             "fast_timestamps": controls["fast_timestamps"][base_tick:fast_end],
             "frame_timestamps": controls["frame_timestamps"][base_frame:frame_end],
             "slow_timestamps": controls["slow_timestamps"][base_slow:slow_end],
-            "health": controls["health"][base_slow:slow_end],
-            "damage_events": controls["damage_events"][base_slow:slow_end],
-            "kill_events": controls["kill_events"][base_slow:slow_end],
-            "charge": controls["charge"][base_slow:slow_end],
             "axes": controls["axes"][base_tick:fast_end],
             "movement": controls["movement"][base_slow:slow_end],
             "buttons": controls["buttons"][base_slow:slow_end],
@@ -479,10 +437,6 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             fast_timestamps=stack("fast_timestamps"),
             frame_timestamps=stack("frame_timestamps"),
             slow_timestamps=stack("slow_timestamps"),
-            health=stack("health"),
-            damage_events=stack("damage_events"),
-            kill_events=stack("kill_events"),
-            charge=stack("charge"),
             axes=stack("axes"),
             movement=stack("movement"),
             buttons=stack("buttons"),

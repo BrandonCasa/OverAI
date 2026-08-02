@@ -12,7 +12,7 @@ import torch
 from .config import ModelConfig
 from .model import HierarchicalImitationController
 from .runtime import load_controller_checkpoint
-from .types import ExecutedActions, ObservationContext, TimingContext
+from .types import ExecutedActions, TimingContext
 
 
 def _elapsed_ms(call: Callable[[], None], iterations: int) -> float:
@@ -72,7 +72,6 @@ def main() -> None:
         device=device,
     )
     zero = lambda width: torch.zeros(1, width, device=device)
-    context = ObservationContext(zero(1), zero(1), zero(1), zero(1))
     actions = ExecutedActions(
         movement=torch.ones(1, 2, dtype=torch.long, device=device),
         buttons=zero(cfg.num_buttons),
@@ -83,12 +82,12 @@ def main() -> None:
     def video(slow: bool = False) -> None:
         nonlocal state
         state = model.on_video_frame(
-            frame, context, actions, timing, state, run_slow_decoder=slow
+            frame, actions, timing, state, run_slow_decoder=slow
         ).state
 
     def fast() -> None:
         nonlocal state
-        _, state = model.fast_tick_between_frames(context, actions, timing, state)
+        _, state = model.fast_tick_between_frames(actions, timing, state)
 
     def slow() -> None:
         nonlocal state

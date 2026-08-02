@@ -16,7 +16,6 @@ from torch.nn import functional as F
 
 from .config import ModelConfig
 from .recording import ControlProfile
-from .telemetry import CapturedFrame
 
 if os.name != "nt":
     raise ImportError("the Windows capture backend is only available on Windows")
@@ -233,7 +232,7 @@ class WindowsCaptureBackend:
             )
         self.target_hwnd = _find_window(self.profile)
         self._frame_lock = threading.Lock()
-        self._latest_frame: CapturedFrame | None = None
+        self._latest_frame: tuple[float, torch.Tensor] | None = None
         self._mouse_lock = threading.Lock()
         self._mouse_events: deque[tuple[float, int, int]] = deque()
         self._held_vks: set[int] = set()
@@ -450,28 +449,7 @@ class WindowsCaptureBackend:
             elif source_size != self._source_size:
                 self._emergency = True
                 return
-            bgra_surface: torch.Tensor | None = None
-            if self.profile.hud_telemetry is not None:
-                reference_width, reference_height = (
-                    self.profile.hud_telemetry.reference_resolution
-                )
-                color_surface = buffer.permute(2, 0, 1).contiguous()
-                if (height, width) != (reference_height, reference_width):
-                    color_surface = (
-                        F.interpolate(
-                            color_surface.unsqueeze(0).float(),
-                            size=(reference_height, reference_width),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        .round()
-                        .clamp(0, 255)
-                        .to(torch.uint8)[0]
-                    )
-                bgra_surface = color_surface
-                channels = color_surface[[2, 0]]
-            else:
-                channels = buffer[..., (2, 0)].permute(2, 0, 1).contiguous()
+            channels = buffer[..., (2, 0)].permute(2, 0, 1).contiguous()
             if tuple(channels.shape[1:]) != (
                 self.cfg.image_height,
                 self.cfg.image_width,
@@ -493,9 +471,7 @@ class WindowsCaptureBackend:
                 time.perf_counter() - preprocess_start
             ) * 1000.0
             with self._frame_lock:
-                self._latest_frame = CapturedFrame(
-                    captured_at, channels, bgra_surface
-                )
+                self._latest_frame = (captured_at, channels)
 
         @capture.event
         def on_closed() -> None:
@@ -518,7 +494,7 @@ class WindowsCaptureBackend:
             self._input_thread = None
         self._input_thread_id = None
 
-    def latest_frame(self, timeout_ms: int) -> CapturedFrame | None:
+    def latest_frame(self, timeout_ms: int) -> tuple[float, torch.Tensor] | None:
         deadline = time.perf_counter() + timeout_ms / 1000
         while True:
             with self._frame_lock:

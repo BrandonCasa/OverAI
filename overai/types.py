@@ -16,14 +16,6 @@ class ExecutedActions:
 
 
 @dataclass(slots=True)
-class ObservationContext:
-    health: torch.Tensor
-    damage_event: torch.Tensor
-    kill_event: torch.Tensor
-    charge: torch.Tensor
-
-
-@dataclass(slots=True)
 class TimingContext:
     absolute_time: torch.Tensor
     since_video_frame: torch.Tensor

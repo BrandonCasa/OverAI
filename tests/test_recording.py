@@ -105,7 +105,6 @@ class RecordingTests(unittest.TestCase):
                     "pause_key": "F8",
                     "emergency_stop_key": "F9",
                     "invert_axes": [False, True],
-                    "telemetry_provider": "zero",
                 }
             ),
             encoding="utf-8",
@@ -131,6 +130,15 @@ class RecordingTests(unittest.TestCase):
             payload["buttons"] = [f"BUTTON_{index}" for index in range(11)]
             path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertEqual(len(ControlProfile.from_json(path).buttons), 11)
+
+    def test_control_profile_rejects_removed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._profile_path(Path(temporary))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["telemetry_provider"] = "zero"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported fields"):
+                ControlProfile.from_json(path)
 
     def test_axis_calibration_and_inverse_residual(self) -> None:
         raw = torch.tensor([[1, 0], [2, -1], [-3, 4]], dtype=torch.int32)
@@ -163,8 +171,10 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(backend.stopped)
             self.assertEqual(backend.frame_timeouts, [2000])
             metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
-            self.assertEqual(metadata["telemetry"]["provider"], "zero")
-            self.assertEqual(metadata["telemetry"]["diagnostics"]["provider"], "zero")
+            self.assertNotIn("telemetry", metadata)
+            self.assertFalse(
+                {"health", "damage_events", "kill_events", "charge"} & controls.keys()
+            )
 
     def test_capture_failure_removes_temporary_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -259,7 +269,7 @@ class RecordingTests(unittest.TestCase):
             self.assertIsInstance(errors[0], RuntimeError)
             self.assertFalse((root / "episodes" / "jpeg-failed.recording").exists())
 
-    def test_finalization_rejects_non_finite_telemetry(self) -> None:
+    def test_finalization_rejects_legacy_hud_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             episode = Path(temporary) / "episode"
             (episode / "frames_r").mkdir(parents=True)
@@ -279,15 +289,12 @@ class RecordingTests(unittest.TestCase):
                 "raw_mouse_deltas": torch.zeros(1, 2, dtype=torch.int32),
                 "fast_durations": torch.ones(1),
                 "axes": torch.zeros(1, 2),
-                "health": torch.tensor([[float("nan")]]),
-                "damage_events": torch.zeros(1, 1),
-                "kill_events": torch.zeros(1, 1),
-                "charge": torch.zeros(1, 1),
+                "health": torch.zeros(1, 1),
                 "movement": torch.ones(1, 2, dtype=torch.long),
                 "buttons": torch.zeros(1, 6, dtype=torch.uint8),
             }
             torch.save(controls, episode / "controls.pt")
-            with self.assertRaisesRegex(ValueError, "health.*finite"):
+            with self.assertRaisesRegex(ValueError, "dataset format 3"):
                 _validate_episode(episode)
 
     def test_finalize_uses_training_scale_for_both_splits(self) -> None:
@@ -313,10 +320,6 @@ class RecordingTests(unittest.TestCase):
                     ),
                     "fast_durations": torch.tensor([0.1, 0.1]),
                     "axes": torch.zeros(2, 2),
-                    "health": torch.zeros(1, 1),
-                    "damage_events": torch.zeros(1, 1),
-                    "kill_events": torch.zeros(1, 1),
-                    "charge": torch.zeros(1, 1),
                     "movement": torch.ones(1, 2, dtype=torch.long),
                     "buttons": torch.zeros(1, 11, dtype=torch.uint8),
                 }
@@ -345,7 +348,8 @@ class RecordingTests(unittest.TestCase):
                 manifest["axis_normalization"]["scale_counts_per_second"],
                 list(normalization.scale_counts_per_second),
             )
-            self.assertEqual(manifest["telemetry"]["provider"], "zero")
+            self.assertNotIn("telemetry", manifest)
+            self.assertEqual(manifest["version"], 3)
             self.assertEqual(manifest["num_buttons"], 11)
 
 

@@ -82,14 +82,6 @@ def create_synthetic_dataset(
         "fast_timestamps": fast_timestamps,
         "frame_timestamps": frame_timestamps,
         "slow_timestamps": slow_timestamps,
-        "health": (1.0 - slow_timestamps[:, None] / max(seconds, 1.0)).clamp(-1, 1),
-        "damage_events": ((torch.arange(slow_count) % (cfg.slow_hz * 2)) == 0)
-        .float()
-        .unsqueeze(-1),
-        "kill_events": ((torch.arange(slow_count) % (cfg.slow_hz * 3)) == 0)
-        .float()
-        .unsqueeze(-1),
-        "charge": torch.sin(slow_timestamps[:, None] * 0.3),
         "axes": axes,
         "movement": movement,
         "buttons": buttons,
@@ -97,11 +89,10 @@ def create_synthetic_dataset(
     controls_path = episode_dir / "controls.pt"
     torch.save(controls, controls_path)
     manifest = {
-        "version": 2,
+        "version": 3,
         "split": split,
         "channels": ["R", "B"],
         "control_profile_sha256": "synthetic-zero-profile",
-        "telemetry": {"provider": "zero", "sha256": None},
         "axis_normalization": {
             "method": "synthetic",
             "percentile": 99.5,

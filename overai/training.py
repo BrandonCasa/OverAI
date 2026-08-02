@@ -122,7 +122,6 @@ def _build_training_datasets(
     for key, label in (
         ("axis_normalization", "axis normalization"),
         ("control_profile_sha256", "control profile"),
-        ("telemetry", "telemetry configuration"),
         ("num_buttons", "button count"),
     ):
         if training_payload.get(key) != validation_payload.get(key):
@@ -208,7 +207,6 @@ def _run_tick(
     state,
     device: torch.device,
 ):
-    context = batch.observation_context(tick, device)
     actions = batch.executed_actions(tick, device)
     timing = batch.timing_context(tick, device)
     slow_due = tick % model.cfg.fast_ticks_per_slow == 0
@@ -216,7 +214,6 @@ def _run_tick(
         frame_index = tick // model.cfg.fast_ticks_per_video
         output = model.on_video_frame(
             batch.load_frame(frame_index, device),
-            context,
             actions,
             timing,
             state,
@@ -224,7 +221,7 @@ def _run_tick(
         )
         return output.fast, output.slow, output.state
     fast_prediction, state = model.fast_tick_between_frames(
-        context, actions, timing, state
+        actions, timing, state
     )
     slow_prediction = None
     if slow_due:
@@ -494,7 +491,6 @@ def save_checkpoint(
     training_cfg: TrainingConfig,
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
-    telemetry: dict[str, Any],
     epoch_complete: bool,
     batches_completed_in_epoch: int,
     data_loader_generator_state: torch.Tensor,
@@ -505,12 +501,11 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format_version": 3,
+            "format_version": 4,
             "model_config": model.cfg.to_dict(),
             "training_config": asdict(training_cfg),
             "axis_normalization": axis_normalization,
             "control_profile_sha256": control_profile_sha256,
-            "telemetry": telemetry,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
@@ -535,7 +530,6 @@ def load_checkpoint(
     *,
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
-    telemetry: dict[str, Any],
 ) -> tuple[
     int,
     int,
@@ -547,7 +541,7 @@ def load_checkpoint(
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
     )
-    if checkpoint_data.get("format_version") != 3:
+    if checkpoint_data.get("format_version") != 4:
         raise ValueError("unsupported checkpoint format")
     if checkpoint_data.get("model_config") != model.cfg.to_dict():
         raise ValueError("checkpoint model configuration does not match")
@@ -555,11 +549,6 @@ def load_checkpoint(
         raise ValueError("checkpoint axis normalization does not match dataset")
     if checkpoint_data.get("control_profile_sha256") != control_profile_sha256:
         raise ValueError("checkpoint control profile does not match dataset")
-    checkpoint_telemetry = checkpoint_data.get(
-        "telemetry", {"provider": "zero", "sha256": None}
-    )
-    if checkpoint_telemetry != telemetry:
-        raise ValueError("checkpoint telemetry configuration does not match dataset")
     model.load_state_dict(checkpoint_data["model"])
     optimizer.load_state_dict(checkpoint_data["optimizer"])
     torch_rng_state = checkpoint_data.get("torch_rng_state")
@@ -676,13 +665,6 @@ def run_training(
     control_profile_sha256 = manifest_payload.get("control_profile_sha256")
     if not isinstance(control_profile_sha256, str) or not control_profile_sha256:
         raise TypeError("training manifest is missing control_profile_sha256")
-    # Pre-HUD format-2 manifests unambiguously used the zero provider.
-    telemetry = manifest_payload.get("telemetry", {"provider": "zero", "sha256": None})
-    if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
-        "zero",
-        "hud_telemetry",
-    }:
-        raise TypeError("training manifest is missing telemetry configuration")
     generator = torch.Generator().manual_seed(training_cfg.seed)
     loader = DataLoader(
         dataset,
@@ -722,7 +704,6 @@ def run_training(
             optimizer,
             axis_normalization=axis_normalization,
             control_profile_sha256=control_profile_sha256,
-            telemetry=telemetry,
         )
         if generator_state is not None:
             generator.set_state(generator_state)
@@ -797,7 +778,6 @@ def run_training(
                     training_cfg,
                     axis_normalization,
                     control_profile_sha256,
-                    telemetry,
                     epoch_complete=False,
                     batches_completed_in_epoch=processed_batches,
                     data_loader_generator_state=epoch_generator_state,
@@ -827,7 +807,6 @@ def run_training(
                 training_cfg,
                 axis_normalization,
                 control_profile_sha256,
-                telemetry,
                 epoch_complete=False,
                 batches_completed_in_epoch=processed_batches,
                 data_loader_generator_state=epoch_generator_state,
@@ -883,7 +862,6 @@ def run_training(
             training_cfg,
             axis_normalization,
             control_profile_sha256,
-            telemetry,
             epoch_complete=True,
             batches_completed_in_epoch=processed_batches,
             data_loader_generator_state=generator.get_state(),
@@ -900,7 +878,6 @@ def run_training(
                 training_cfg,
                 axis_normalization,
                 control_profile_sha256,
-                telemetry,
                 epoch_complete=True,
                 batches_completed_in_epoch=processed_batches,
                 data_loader_generator_state=generator.get_state(),

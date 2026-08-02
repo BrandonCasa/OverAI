@@ -62,10 +62,6 @@ class TrainingPipelineTests(unittest.TestCase):
             batch = dataset.collate([dataset[0]])
             self.assertEqual(batch.process_ticks, cfg.fast_hz)
             self.assertEqual(batch.movement.shape[-1], 2)
-            self.assertEqual(
-                batch.health.shape[1], cfg.slow_hz + cfg.slow_horizon - 1
-            )
-            first_context = batch.observation_context(0, torch.device("cpu"))
             initial_actions = batch.executed_actions(0, torch.device("cpu"))
             self.assertTrue(torch.equal(initial_actions.axes, torch.zeros_like(initial_actions.axes)))
             self.assertTrue(
@@ -74,14 +70,6 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertTrue(
                 torch.equal(initial_actions.buttons, torch.zeros_like(initial_actions.buttons))
             )
-            held_context = batch.observation_context(
-                cfg.fast_ticks_per_slow - 1, torch.device("cpu")
-            )
-            self.assertTrue(torch.equal(first_context.health, held_context.health))
-            next_context = batch.observation_context(
-                cfg.fast_ticks_per_slow, torch.device("cpu")
-            )
-            self.assertFalse(torch.equal(first_context.health, next_context.health))
             timing = batch.timing_context(0, torch.device("cpu"))
             self.assertEqual(timing.absolute_time.dtype, torch.float32)
             self.assertEqual(timing.since_video_frame.dtype, torch.float32)
@@ -184,16 +172,16 @@ class TrainingPipelineTests(unittest.TestCase):
                     training_cfg,
                 )
 
-    def test_manifest_validation_rejects_non_finite_telemetry(self) -> None:
+    def test_manifest_validation_rejects_legacy_hud_controls(self) -> None:
         cfg = ModelConfig.tiny()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = create_synthetic_dataset(root, cfg, seconds=4.0)
             controls_path = root / "episodes" / "synthetic-001" / "controls.pt"
             controls = torch.load(controls_path, weights_only=True)
-            controls["health"][0, 0] = float("nan")
+            controls["health"] = torch.zeros(controls["movement"].shape[0], 1)
             torch.save(controls, controls_path)
-            with self.assertRaisesRegex(ValueError, "health contains non-finite"):
+            with self.assertRaisesRegex(ValueError, "unexpected controls: health"):
                 dataset_summary(manifest, cfg)
 
     def test_manifest_discards_one_unpaired_terminal_fast_tick(self) -> None:
@@ -230,7 +218,6 @@ class TrainingPipelineTests(unittest.TestCase):
             "percentile": 99.5,
             "scale_counts_per_second": [10.0, 20.0],
         }
-        telemetry = {"provider": "zero", "sha256": None}
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "checkpoint.pt"
             source = HierarchicalImitationController(cfg)
@@ -245,7 +232,6 @@ class TrainingPipelineTests(unittest.TestCase):
                 training_cfg=training_cfg,
                 axis_normalization=axis_normalization,
                 control_profile_sha256="profile-a",
-                telemetry=telemetry,
                 epoch_complete=False,
                 batches_completed_in_epoch=7,
                 data_loader_generator_state=generator_state,
@@ -260,7 +246,6 @@ class TrainingPipelineTests(unittest.TestCase):
                 target_optimizer,
                 axis_normalization=axis_normalization,
                 control_profile_sha256="profile-a",
-                telemetry=telemetry,
             )
             self.assertEqual(resume_state[:3], (2, 17, 7))
             restored_generator_state = resume_state[3]
@@ -273,11 +258,10 @@ class TrainingPipelineTests(unittest.TestCase):
             )
 
             mismatches = (
-                ({**axis_normalization, "scale_counts_per_second": [1.0, 2.0]}, "profile-a", telemetry, "axis normalization"),
-                (axis_normalization, "profile-b", telemetry, "control profile"),
-                (axis_normalization, "profile-a", {"provider": "hud_telemetry", "sha256": "other"}, "telemetry"),
+                ({**axis_normalization, "scale_counts_per_second": [1.0, 2.0]}, "profile-a", "axis normalization"),
+                (axis_normalization, "profile-b", "control profile"),
             )
-            for axes, profile_hash, telemetry_manifest, message in mismatches:
+            for axes, profile_hash, message in mismatches:
                 with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                     load_checkpoint(
                         checkpoint,
@@ -285,7 +269,6 @@ class TrainingPipelineTests(unittest.TestCase):
                         target_optimizer,
                         axis_normalization=axes,
                         control_profile_sha256=profile_hash,
-                        telemetry=telemetry_manifest,
                     )
 
             payload = torch.load(checkpoint, weights_only=True)
@@ -297,7 +280,6 @@ class TrainingPipelineTests(unittest.TestCase):
                 target_optimizer,
                 axis_normalization=axis_normalization,
                 control_profile_sha256="profile-a",
-                telemetry=telemetry,
             )
             self.assertEqual(resume_state[:3], (3, 17, 0))
             restored_generator_state = resume_state[3]
