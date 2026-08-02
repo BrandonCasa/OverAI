@@ -1,7 +1,7 @@
 [project]
 name = "overai"
 version = "0.1.0"
-description = "Minimal NVIDIA GPU PyTorch environment"
+description = "Hierarchical supervised imitation controller for classic games"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,6 +14,15 @@ dependencies = [
     "transformers",
 ]
 
+[project.scripts]
+overai-benchmark = "overai.benchmark:main"
+overai-synthetic = "overai.synthetic:main"
+overai-train = "overai.training:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
@@ -22,3 +31,8 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+]
