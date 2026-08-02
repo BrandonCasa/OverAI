@@ -197,6 +197,11 @@ class WindowsCaptureBackend:
     def __init__(self, profile_path: Path, cfg: ModelConfig) -> None:
         self.profile = ControlProfile.from_json(profile_path)
         self.cfg = cfg
+        if len(self.profile.buttons) != cfg.num_buttons:
+            raise ValueError(
+                "control profile button count does not match model config: "
+                f"{len(self.profile.buttons)} != {cfg.num_buttons}"
+            )
         self.target_hwnd = _find_window(self.profile)
         self._frame_lock = threading.Lock()
         self._latest_frame: CapturedFrame | None = None
@@ -528,8 +533,11 @@ class WindowsCaptureBackend:
     def apply_discrete(
         self, movement: tuple[int, int], buttons: tuple[bool, ...]
     ) -> None:
-        if len(buttons) != 6:
-            raise ValueError("inference buttons must contain six values")
+        if len(buttons) != len(self.profile.buttons):
+            raise ValueError(
+                "inference button count does not match control profile: "
+                f"{len(buttons)} != {len(self.profile.buttons)}"
+            )
         desired: set[str] = set()
         if movement[0] == 0:
             desired.add(self.profile.movement["left"])

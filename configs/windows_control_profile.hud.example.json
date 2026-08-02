@@ -12,10 +12,12 @@
   "buttons": [
     "MOUSE1",
     "MOUSE2",
+    "MOUSE5",
     "SPACE",
+    "SHIFT",
     "E",
-    "Q",
-    "SHIFT"
+    "R",
+    "Q"
   ],
   "pause_key": "F8",
   "emergency_stop_key": "F9",

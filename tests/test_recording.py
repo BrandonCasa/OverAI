@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -95,6 +96,14 @@ class RecordingTests(unittest.TestCase):
                 (1, 0),
             )
 
+    def test_control_profile_accepts_any_positive_button_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._profile_path(Path(temporary))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["buttons"] = [f"BUTTON_{index}" for index in range(11)]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(len(ControlProfile.from_json(path).buttons), 11)
+
     def test_axis_calibration_and_inverse_residual(self) -> None:
         raw = torch.tensor([[1, 0], [2, -1], [-3, 4]], dtype=torch.int32)
         durations = torch.full((3,), 0.1)
@@ -111,7 +120,7 @@ class RecordingTests(unittest.TestCase):
     def test_recorder_closes_pause_segment_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            cfg = ModelConfig.tiny()
+            cfg = replace(ModelConfig.tiny(), num_buttons=6)
             profile = ControlProfile.from_json(self._profile_path(root))
             backend = _SyntheticBackend(cfg)
             episode = EpisodeRecorder(
@@ -131,7 +140,7 @@ class RecordingTests(unittest.TestCase):
     def test_capture_failure_removes_temporary_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            cfg = ModelConfig.tiny()
+            cfg = replace(ModelConfig.tiny(), num_buttons=6)
             profile = ControlProfile.from_json(self._profile_path(root))
             backend = _SyntheticBackend(cfg, fail_capture=True)
             with self.assertRaisesRegex(RuntimeError, "no fresh"):
@@ -168,7 +177,7 @@ class RecordingTests(unittest.TestCase):
                     "kill_events": torch.zeros(1, 1),
                     "charge": torch.zeros(1, 1),
                     "movement": torch.ones(1, 2, dtype=torch.long),
-                    "buttons": torch.zeros(1, 6, dtype=torch.uint8),
+                    "buttons": torch.zeros(1, 11, dtype=torch.uint8),
                 }
                 torch.save(controls, episode / "controls.pt")
                 (episode / "episode.json").write_text(
@@ -196,6 +205,7 @@ class RecordingTests(unittest.TestCase):
                 list(normalization.scale_counts_per_second),
             )
             self.assertEqual(manifest["telemetry"]["provider"], "zero")
+            self.assertEqual(manifest["num_buttons"], 11)
 
 
 if __name__ == "__main__":

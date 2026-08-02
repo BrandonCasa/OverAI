@@ -10,7 +10,7 @@ The default model is the uploaded specification:
 - 1920×1080 planar red/blue input split into 40×40 patches, preserving a 48×27 grid; green is never reconstructed
 - shifted 9×8 local-window vision attention instead of quadratic global attention
 - causal memory covering roughly 30 seconds at recent, intermediate, and long rates
-- two-dimensional discrete movement and six-button state control at 5 Hz
+- two-dimensional discrete movement and configurable button-state control at 5 Hz
 - two bounded continuous axes at 60 Hz
 - parallel 2-second trajectories (10 discrete states and 120 axis samples)
 - fixed-shape H100 BF16 training and RTX 4080-only FP16 TensorRT-RTX deployment
@@ -126,7 +126,8 @@ uv run overai-train `
 
 Copy `configs/windows_control_profile.example.json` for explicit zero telemetry, or
 `configs/windows_control_profile.hud.example.json` for HUD analysis. Set the
-required process, title regex, movement keys, exactly six buttons,
+required process, title regex, movement keys, and the same number of buttons as
+`num_buttons` in the model config,
 pause/emergency keys, and axis inversion. The HUD example's coordinates and
 colors are deliberately non-production placeholders: replace every bounding box,
 sample point, color, and maximum-health value from 1920x1080 reference captures.

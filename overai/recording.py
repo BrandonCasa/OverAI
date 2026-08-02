@@ -71,10 +71,10 @@ class ControlProfile:
         buttons = payload.get("buttons")
         if (
             not isinstance(buttons, list)
-            or len(buttons) != 6
+            or not buttons
             or any(not isinstance(value, str) or not value for value in buttons)
         ):
-            raise ValueError("buttons must contain exactly six input names")
+            raise ValueError("buttons must contain at least one input name")
         invert_axes = payload.get("invert_axes", [False, False])
         if (
             not isinstance(invert_axes, list)
@@ -244,6 +244,11 @@ class EpisodeRecorder:
         self.split = split
         self.episode_id = episode_id
         self.telemetry_worker = telemetry_worker
+        if len(profile.buttons) != cfg.num_buttons:
+            raise ValueError(
+                "control profile button count does not match model config: "
+                f"{len(profile.buttons)} != {cfg.num_buttons}"
+            )
 
     @staticmethod
     def _movement(held: set[str], bindings: dict[str, str]) -> tuple[int, int]:
@@ -437,7 +442,9 @@ def _episode_entry(root: Path, episode_dir: Path) -> dict[str, str]:
     }
 
 
-def _validate_episode(episode: Path) -> tuple[torch.Tensor, torch.Tensor]:
+def _validate_episode(
+    episode: Path, expected_num_buttons: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate one closed segment before it can enter a manifest."""
 
     if episode.name.endswith(".recording"):
@@ -475,8 +482,14 @@ def _validate_episode(episode: Path) -> tuple[torch.Tensor, torch.Tensor]:
         raise ValueError(f"{episode}: fast durations must have shape [T_fast]")
     if controls["movement"].shape != (slow_count, 2):
         raise ValueError(f"{episode}: movement must have shape [T_slow, 2]")
-    if controls["buttons"].shape != (slow_count, 6):
-        raise ValueError(f"{episode}: buttons must have shape [T_slow, 6]")
+    buttons = controls["buttons"]
+    if buttons.ndim != 2 or buttons.shape[0] != slow_count or buttons.shape[1] <= 0:
+        raise ValueError(f"{episode}: buttons must have shape [T_slow, num_buttons]")
+    if expected_num_buttons is not None and buttons.shape[1] != expected_num_buttons:
+        raise ValueError(
+            f"{episode}: button count {buttons.shape[1]} does not match "
+            f"dataset button count {expected_num_buttons}"
+        )
     for name in ("health", "damage_events", "kill_events", "charge"):
         if controls[name].shape != (slow_count, 1):
             raise ValueError(f"{episode}: {name} must have shape [T_slow, 1]")
@@ -512,12 +525,18 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
         raise ValueError(f"episode ids overlap across splits: {sorted(duplicate_ids)}")
     raw_parts: list[torch.Tensor] = []
     duration_parts: list[torch.Tensor] = []
+    num_buttons: int | None = None
     for episode in train_episodes:
-        raw, durations = _validate_episode(episode)
+        raw, durations = _validate_episode(episode, num_buttons)
+        if num_buttons is None:
+            controls = torch.load(
+                episode / "controls.pt", map_location="cpu", weights_only=True
+            )
+            num_buttons = int(controls["buttons"].shape[1])
         raw_parts.append(raw)
         duration_parts.append(durations)
     for episode in validation_episodes:
-        _validate_episode(episode)
+        _validate_episode(episode, num_buttons)
     normalization = AxisNormalization.derive(
         torch.cat(raw_parts), torch.cat(duration_parts)
     )
@@ -576,6 +595,7 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
             "split": split,
             "channels": ["R", "B"],
             "axis_normalization": normalization.to_manifest(),
+            "num_buttons": num_buttons,
             "control_profile_sha256": next(iter(profile_hashes)),
             "telemetry": telemetry_manifest,
             "episodes": entries,
