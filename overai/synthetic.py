@@ -17,7 +17,13 @@ def create_synthetic_dataset(
     output_dir: Path,
     cfg: ModelConfig,
     seconds: float,
+    split: str = "train",
+    episode_id: str = "synthetic-001",
 ) -> Path:
+    if split not in {"train", "validation"}:
+        raise ValueError("synthetic split must be train or validation")
+    if not episode_id:
+        raise ValueError("synthetic episode id cannot be empty")
     fast_count = round(seconds * cfg.fast_hz)
     if fast_count < cfg.fast_hz + cfg.fast_horizon:
         raise ValueError(
@@ -25,7 +31,7 @@ def create_synthetic_dataset(
         )
     frame_count = math.ceil(fast_count / cfg.fast_ticks_per_video)
     slow_count = math.ceil(fast_count / cfg.fast_ticks_per_slow)
-    episode_dir = output_dir / "episodes" / "synthetic-001"
+    episode_dir = output_dir / "episodes" / episode_id
     red_frame_dir = episode_dir / "frames_r"
     blue_frame_dir = episode_dir / "frames_b"
     red_frame_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +98,7 @@ def create_synthetic_dataset(
     torch.save(controls, controls_path)
     manifest = {
         "version": 2,
-        "split": "train",
+        "split": split,
         "channels": ["R", "B"],
         "control_profile_sha256": "synthetic-zero-profile",
         "telemetry": {"provider": "zero", "sha256": None},
@@ -103,10 +109,10 @@ def create_synthetic_dataset(
         },
         "episodes": [
             {
-                "id": "synthetic-001",
-                "red_frames": "episodes/synthetic-001/frames_r",
-                "blue_frames": "episodes/synthetic-001/frames_b",
-                "controls": "episodes/synthetic-001/controls.pt",
+                "id": episode_id,
+                "red_frames": f"episodes/{episode_id}/frames_r",
+                "blue_frames": f"episodes/{episode_id}/frames_b",
+                "controls": f"episodes/{episode_id}/controls.pt",
             }
         ],
     }
@@ -121,13 +127,23 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("data/synthetic"))
     parser.add_argument("--seconds", type=float, default=4.0)
     parser.add_argument("--model-config", type=Path)
+    parser.add_argument("--split", choices=("train", "validation"), default="train")
+    parser.add_argument("--episode-id", default="synthetic-001")
     args = parser.parse_args()
     cfg = (
         ModelConfig.from_json(args.model_config)
         if args.model_config
         else ModelConfig.tiny()
     )
-    print(create_synthetic_dataset(args.output, cfg, args.seconds))
+    print(
+        create_synthetic_dataset(
+            args.output,
+            cfg,
+            args.seconds,
+            split=args.split,
+            episode_id=args.episode_id,
+        )
+    )
 
 
 if __name__ == "__main__":

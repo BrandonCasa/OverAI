@@ -46,15 +46,16 @@ try {
 
     $arguments = @(
         "--manifest", $trainManifest,
+        "--validation-manifest", $validationManifest,
         "--model-config", $modelConfig,
         "--output", $output,
-        "--batch-size", "1",
+        "--batch-size", "4",
         "--epochs", "$Epochs",
         "--history-seconds", "5",
         "--optimization-seconds", "2",
         "--stride-seconds", "2",
         "--tbptt-seconds", "0.1",
-        "--num-workers", "2",
+        "--num-workers", "4",
         "--checkpoint-every-steps", "120",
         "--bf16"
     )

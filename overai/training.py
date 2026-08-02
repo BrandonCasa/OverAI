@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -71,6 +73,93 @@ class BatchResult:
     mean_loss: float
     optimizer_steps: int
     metrics: dict[str, float]
+
+
+def _read_manifest_payload(path: Path, expected_split: str) -> dict[str, Any]:
+    payload: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"{expected_split} manifest must be an object")
+    actual_split = payload.get("split")
+    if actual_split != expected_split:
+        raise ValueError(
+            f"{expected_split} manifest split must be {expected_split}, "
+            f"found {actual_split!r}"
+        )
+    return payload
+
+
+def _build_training_datasets(
+    training_manifest: Path,
+    validation_manifest: Path,
+    model_cfg: ModelConfig,
+    training_cfg: TrainingConfig,
+) -> tuple[
+    DemonstrationWindowDataset,
+    DemonstrationWindowDataset,
+    dict[str, Any],
+    dict[str, Any],
+]:
+    if training_manifest.resolve() == validation_manifest.resolve():
+        raise ValueError("training and validation manifests must be different files")
+
+    training_payload = _read_manifest_payload(training_manifest, "train")
+    validation_payload = _read_manifest_payload(validation_manifest, "validation")
+    training_dataset = DemonstrationWindowDataset(
+        training_manifest,
+        model_cfg,
+        history_seconds=training_cfg.history_seconds,
+        optimization_seconds=training_cfg.optimization_seconds,
+        stride_seconds=training_cfg.stride_seconds,
+    )
+    validation_dataset = DemonstrationWindowDataset(
+        validation_manifest,
+        model_cfg,
+        history_seconds=training_cfg.history_seconds,
+        optimization_seconds=training_cfg.optimization_seconds,
+        stride_seconds=training_cfg.stride_seconds,
+    )
+
+    for key, label in (
+        ("axis_normalization", "axis normalization"),
+        ("control_profile_sha256", "control profile"),
+        ("telemetry", "telemetry configuration"),
+        ("num_buttons", "button count"),
+    ):
+        if training_payload.get(key) != validation_payload.get(key):
+            raise ValueError(
+                f"training and validation manifests have different {label}"
+            )
+
+    training_ids = {record.episode_id for record in training_dataset.records}
+    validation_ids = {record.episode_id for record in validation_dataset.records}
+    overlapping_ids = sorted(training_ids & validation_ids)
+    if overlapping_ids:
+        raise ValueError(
+            "training and validation manifests share episode ids: "
+            + ", ".join(overlapping_ids)
+        )
+
+    training_files = {
+        path.resolve()
+        for record in training_dataset.records
+        for pair in record.frame_pairs
+        for path in (*pair, record.controls_path)
+    }
+    validation_files = {
+        path.resolve()
+        for record in validation_dataset.records
+        for pair in record.frame_pairs
+        for path in (*pair, record.controls_path)
+    }
+    if training_files & validation_files:
+        raise ValueError("training and validation manifests share episode files")
+
+    return (
+        training_dataset,
+        validation_dataset,
+        training_payload,
+        validation_payload,
+    )
 
 
 def configure_runtime(device: torch.device, seed: int) -> None:
@@ -223,6 +312,164 @@ def train_sequence_batch(
     )
 
 
+def evaluate_model(
+    model: HierarchicalImitationController,
+    batches: Iterable[SequenceBatch],
+    device: torch.device,
+    use_bf16: bool,
+    loss_weights: LossWeights | None = None,
+) -> dict[str, float]:
+    """Evaluate causal windows without gradients or optimizer updates."""
+
+    cfg = model.cfg
+    weights = loss_weights or LossWeights()
+    total_loss = 0.0
+    total_prediction_terms = 0
+    metric_totals: dict[str, float] = {}
+    metric_counts: dict[str, int] = {}
+    movement_confusion = torch.zeros(2, 3, 3, dtype=torch.int64)
+    button_true_positives = 0
+    button_false_positives = 0
+    button_false_negatives = 0
+    button_correct = 0
+    button_total = 0
+    immediate_axis_absolute_error = 0.0
+    immediate_axis_values = 0
+    windows = 0
+
+    model.eval()
+    with torch.inference_mode():
+        for batch in batches:
+            windows += batch.batch_size
+            state = model.initial_state(batch.batch_size, device)
+            for tick in range(batch.process_ticks):
+                with _autocast_context(device, use_bf16):
+                    fast_prediction, slow_prediction, state = _run_tick(
+                        model, batch, tick, state, device
+                    )
+                    if tick < batch.history_ticks:
+                        continue
+
+                    fast_targets = FastTargets(
+                        axes=batch.axes[:, tick : tick + cfg.fast_horizon].to(
+                            device, non_blocking=True
+                        )
+                    )
+                    fast_losses = fast_axis_loss(fast_prediction, fast_targets, cfg)
+                    tick_loss = weighted_fast_total(fast_losses, weights)
+                    prediction_terms = 1
+                    all_losses = dict(fast_losses)
+
+                    immediate_axis_absolute_error += float(
+                        (fast_prediction.immediate_axes - fast_targets.axes[:, 0])
+                        .abs()
+                        .sum()
+                    )
+                    immediate_axis_values += fast_targets.axes[:, 0].numel()
+
+                    if slow_prediction is not None:
+                        slow_index = tick // cfg.fast_ticks_per_slow
+                        slow_targets = SlowTargets(
+                            movement=batch.movement[
+                                :, slow_index : slow_index + cfg.slow_horizon
+                            ].to(device, non_blocking=True),
+                            buttons=batch.buttons[
+                                :, slow_index : slow_index + cfg.slow_horizon
+                            ].to(device, non_blocking=True),
+                        )
+                        slow_losses = slow_control_loss(
+                            slow_prediction, slow_targets, cfg
+                        )
+                        tick_loss = tick_loss + weighted_slow_total(
+                            slow_losses, weights
+                        )
+                        prediction_terms += 1
+                        all_losses.update(slow_losses)
+
+                        movement_prediction = (
+                            slow_prediction.immediate_movement_logits.argmax(dim=-1)
+                        )
+                        movement_target = slow_targets.movement[:, 0].long()
+                        for axis in range(2):
+                            encoded = (
+                                movement_target[:, axis] * 3
+                                + movement_prediction[:, axis]
+                            )
+                            movement_confusion[axis] += torch.bincount(
+                                encoded.cpu(), minlength=9
+                            ).reshape(3, 3)
+
+                        button_prediction = (
+                            slow_prediction.immediate_button_logits >= 0
+                        )
+                        button_target = slow_targets.buttons[:, 0].bool()
+                        button_true_positives += int(
+                            (button_prediction & button_target).sum()
+                        )
+                        button_false_positives += int(
+                            (button_prediction & ~button_target).sum()
+                        )
+                        button_false_negatives += int(
+                            (~button_prediction & button_target).sum()
+                        )
+                        button_correct += int(
+                            (button_prediction == button_target).sum()
+                        )
+                        button_total += button_target.numel()
+
+                batch_size = batch.batch_size
+                total_loss += float(tick_loss) * batch_size
+                total_prediction_terms += prediction_terms * batch_size
+                for name, value in all_losses.items():
+                    metric_totals[name] = metric_totals.get(name, 0.0) + (
+                        float(value) * batch_size
+                    )
+                    metric_counts[name] = metric_counts.get(name, 0) + batch_size
+
+    if windows == 0 or total_prediction_terms == 0:
+        raise ValueError("validation loader produced no usable windows")
+
+    movement_correct = int(movement_confusion.diagonal(dim1=1, dim2=2).sum())
+    movement_total = int(movement_confusion.sum())
+    movement_f1_values: list[float] = []
+    for axis in range(2):
+        for class_index in range(3):
+            true_positive = int(movement_confusion[axis, class_index, class_index])
+            false_positive = int(movement_confusion[axis, :, class_index].sum()) - true_positive
+            false_negative = int(movement_confusion[axis, class_index, :].sum()) - true_positive
+            denominator = 2 * true_positive + false_positive + false_negative
+            if denominator:
+                movement_f1_values.append(2 * true_positive / denominator)
+
+    button_f1_denominator = (
+        2 * button_true_positives + button_false_positives + button_false_negatives
+    )
+    metrics = {
+        "loss": total_loss / total_prediction_terms,
+        "movement_accuracy": movement_correct / max(movement_total, 1),
+        "movement_macro_f1": sum(movement_f1_values)
+        / max(len(movement_f1_values), 1),
+        "button_accuracy": button_correct / max(button_total, 1),
+        "button_f1": (
+            2 * button_true_positives / button_f1_denominator
+            if button_f1_denominator
+            else 0.0
+        ),
+        "immediate_axis_mae": immediate_axis_absolute_error
+        / max(immediate_axis_values, 1),
+        "windows": float(windows),
+    }
+    metrics.update(
+        {
+            name: value / metric_counts[name]
+            for name, value in metric_totals.items()
+        }
+    )
+    if not all(math.isfinite(value) for value in metrics.values()):
+        raise FloatingPointError("validation produced non-finite metrics")
+    return metrics
+
+
 def save_checkpoint(
     path: Path,
     model: HierarchicalImitationController,
@@ -236,6 +483,8 @@ def save_checkpoint(
     epoch_complete: bool,
     batches_completed_in_epoch: int,
     data_loader_generator_state: torch.Tensor,
+    best_validation_loss: float | None = None,
+    validation_metrics: dict[str, float] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -256,6 +505,8 @@ def save_checkpoint(
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
             "global_step": global_step,
+            "best_validation_loss": best_validation_loss,
+            "validation_metrics": validation_metrics,
         },
         temporary,
     )
@@ -270,7 +521,14 @@ def load_checkpoint(
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
     telemetry: dict[str, Any],
-) -> tuple[int, int, int | None, torch.Tensor | None]:
+) -> tuple[
+    int,
+    int,
+    int | None,
+    torch.Tensor | None,
+    float,
+    dict[str, float] | None,
+]:
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
     )
@@ -308,11 +566,36 @@ def load_checkpoint(
     generator_state = checkpoint_data.get("data_loader_generator_state")
     if generator_state is not None and not isinstance(generator_state, torch.Tensor):
         raise TypeError("checkpoint data-loader generator state is invalid")
+    best_validation_loss_value = checkpoint_data.get("best_validation_loss")
+    if best_validation_loss_value is None:
+        best_validation_loss = math.inf
+    elif not isinstance(best_validation_loss_value, (int, float)) or not math.isfinite(
+        best_validation_loss_value
+    ):
+        raise ValueError("checkpoint best validation loss is invalid")
+    else:
+        best_validation_loss = float(best_validation_loss_value)
+    validation_metrics_value = checkpoint_data.get("validation_metrics")
+    if validation_metrics_value is None:
+        validation_metrics = None
+    elif not isinstance(validation_metrics_value, dict) or not all(
+        isinstance(name, str)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        for name, value in validation_metrics_value.items()
+    ):
+        raise ValueError("checkpoint validation metrics are invalid")
+    else:
+        validation_metrics = {
+            name: float(value) for name, value in validation_metrics_value.items()
+        }
     return (
         resume_epoch,
         int(checkpoint_data["global_step"]),
         batches_completed,
         generator_state,
+        best_validation_loss,
+        validation_metrics,
     )
 
 
@@ -349,6 +632,7 @@ def _make_optimizer(
 
 def run_training(
     manifest: Path,
+    validation_manifest: Path,
     output_dir: Path,
     model_cfg: ModelConfig,
     training_cfg: TrainingConfig,
@@ -362,14 +646,17 @@ def run_training(
         raise RuntimeError("the selected CUDA device does not support bfloat16")
     configure_runtime(device, training_cfg.seed)
 
-    dataset = DemonstrationWindowDataset(
+    (
+        dataset,
+        validation_dataset,
+        manifest_payload,
+        _,
+    ) = _build_training_datasets(
         manifest,
+        validation_manifest,
         model_cfg,
-        history_seconds=training_cfg.history_seconds,
-        optimization_seconds=training_cfg.optimization_seconds,
-        stride_seconds=training_cfg.stride_seconds,
+        training_cfg,
     )
-    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
     axis_normalization = manifest_payload.get("axis_normalization")
     if not isinstance(axis_normalization, dict):
         raise TypeError("training manifest is missing axis_normalization")
@@ -395,17 +682,29 @@ def run_training(
         persistent_workers=training_cfg.num_workers > 0,
         generator=generator,
     )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=training_cfg.batch_size,
+        shuffle=False,
+        num_workers=training_cfg.num_workers,
+        collate_fn=validation_dataset.collate,
+        persistent_workers=training_cfg.num_workers > 0,
+    )
     model = HierarchicalImitationController(model_cfg).to(device)
     optimizer = _make_optimizer(model, training_cfg, device)
     start_epoch = 0
     global_step = 0
     resume_batches: int | None = 0
+    best_validation_loss = math.inf
+    last_validation_metrics: dict[str, float] | None = None
     if resume is not None:
         (
             start_epoch,
             global_step,
             resume_batches,
             generator_state,
+            best_validation_loss,
+            last_validation_metrics,
         ) = load_checkpoint(
             resume,
             model,
@@ -445,6 +744,7 @@ def run_training(
         f"device={device_properties.name} "
         f"vram_gib={device_properties.total_memory / 2**30:.1f} "
         f"parameters={parameter_count(model):,} windows={len(dataset)} "
+        f"validation_windows={len(validation_dataset)} "
         f"bf16={training_cfg.bf16}"
     )
 
@@ -492,6 +792,12 @@ def run_training(
                     epoch_complete=False,
                     batches_completed_in_epoch=processed_batches,
                     data_loader_generator_state=epoch_generator_state,
+                    best_validation_loss=(
+                        None
+                        if math.isinf(best_validation_loss)
+                        else best_validation_loss
+                    ),
+                    validation_metrics=last_validation_metrics,
                 )
             if (
                 max_batches is not None
@@ -504,6 +810,66 @@ def run_training(
             f"epoch={epoch + 1} mean_loss={mean_epoch_loss:.5f} "
             f"seconds={time.perf_counter() - epoch_start:.1f}"
         )
+        epoch_complete = processed_batches == len(loader)
+        if not epoch_complete:
+            save_checkpoint(
+                output_dir / "checkpoint_last.pt",
+                model,
+                optimizer,
+                epoch,
+                global_step,
+                training_cfg,
+                axis_normalization,
+                control_profile_sha256,
+                telemetry,
+                epoch_complete=False,
+                batches_completed_in_epoch=processed_batches,
+                data_loader_generator_state=epoch_generator_state,
+                best_validation_loss=(
+                    None
+                    if math.isinf(best_validation_loss)
+                    else best_validation_loss
+                ),
+                validation_metrics=last_validation_metrics,
+            )
+            return
+
+        validation_start = time.perf_counter()
+        validation_metrics = evaluate_model(
+            model,
+            validation_loader,
+            device,
+            use_bf16=training_cfg.bf16,
+        )
+        validation_loss = validation_metrics["loss"]
+        improved = validation_loss < best_validation_loss
+        if improved:
+            best_validation_loss = validation_loss
+        last_validation_metrics = validation_metrics
+        print(
+            f"validation epoch={epoch + 1} loss={validation_loss:.5f} "
+            f"movement_accuracy={validation_metrics['movement_accuracy']:.4f} "
+            f"movement_macro_f1={validation_metrics['movement_macro_f1']:.4f} "
+            f"button_accuracy={validation_metrics['button_accuracy']:.4f} "
+            f"button_f1={validation_metrics['button_f1']:.4f} "
+            f"axis_mae={validation_metrics['immediate_axis_mae']:.5f} "
+            f"seconds={time.perf_counter() - validation_start:.1f}"
+        )
+        with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(
+                json.dumps(
+                    {
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "training_loss": mean_epoch_loss,
+                        "validation": validation_metrics,
+                        "best_validation_loss": best_validation_loss,
+                        "is_best": improved,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
         save_checkpoint(
             output_dir / "checkpoint_last.pt",
             model,
@@ -514,20 +880,40 @@ def run_training(
             axis_normalization,
             control_profile_sha256,
             telemetry,
-            epoch_complete=processed_batches == len(loader),
+            epoch_complete=True,
             batches_completed_in_epoch=processed_batches,
-            data_loader_generator_state=(
-                generator.get_state()
-                if processed_batches == len(loader)
-                else epoch_generator_state
-            ),
+            data_loader_generator_state=generator.get_state(),
+            best_validation_loss=best_validation_loss,
+            validation_metrics=validation_metrics,
         )
+        if improved:
+            save_checkpoint(
+                output_dir / "checkpoint_best.pt",
+                model,
+                optimizer,
+                epoch,
+                global_step,
+                training_cfg,
+                axis_normalization,
+                control_profile_sha256,
+                telemetry,
+                epoch_complete=True,
+                batches_completed_in_epoch=processed_batches,
+                data_loader_generator_state=generator.get_state(),
+                best_validation_loss=best_validation_loss,
+                validation_metrics=validation_metrics,
+            )
         resume_batches = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--validation-manifest",
+        type=Path,
+        help="held-out validation manifest (required for training)",
+    )
     parser.add_argument("--output", type=Path, default=Path("runs/default"))
     parser.add_argument("--model-config", type=Path)
     parser.add_argument(
@@ -580,6 +966,8 @@ def main() -> None:
         )
         print(json.dumps(summary, indent=2))
         return
+    if args.validation_manifest is None:
+        raise SystemExit("--validation-manifest is required for training")
     training_cfg = TrainingConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -597,6 +985,7 @@ def main() -> None:
     )
     run_training(
         args.manifest,
+        args.validation_manifest,
         args.output,
         model_cfg,
         training_cfg,

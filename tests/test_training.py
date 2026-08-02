@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,9 @@ from overai.model import HierarchicalImitationController
 from overai.synthetic import create_synthetic_dataset
 from overai.training import (
     TrainingConfig,
+    _build_training_datasets,
     _legacy_batches_completed_in_epoch,
+    evaluate_model,
     load_checkpoint,
     save_checkpoint,
     train_sequence_batch,
@@ -81,6 +84,81 @@ class TrainingPipelineTests(unittest.TestCase):
             )
             self.assertTrue(torch.isfinite(torch.tensor(result.mean_loss)))
             self.assertEqual(result.optimizer_steps, 2)
+            parameters_after_training = {
+                name: parameter.detach().clone()
+                for name, parameter in model.named_parameters()
+            }
+            validation_metrics = evaluate_model(
+                model,
+                [batch],
+                torch.device("cpu"),
+                use_bf16=False,
+            )
+            self.assertTrue(torch.isfinite(torch.tensor(validation_metrics["loss"])))
+            self.assertGreaterEqual(validation_metrics["movement_accuracy"], 0.0)
+            self.assertLessEqual(validation_metrics["movement_accuracy"], 1.0)
+            self.assertGreaterEqual(validation_metrics["button_f1"], 0.0)
+            self.assertLessEqual(validation_metrics["button_f1"], 1.0)
+            for name, parameter in model.named_parameters():
+                self.assertTrue(torch.equal(parameter, parameters_after_training[name]))
+
+    def test_training_and_validation_manifests_are_separate_and_disjoint(self) -> None:
+        cfg = ModelConfig.tiny()
+        training_cfg = TrainingConfig(
+            history_seconds=0.0,
+            optimization_seconds=1.0,
+            stride_seconds=1.0,
+            num_workers=0,
+            bf16=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            training_manifest = create_synthetic_dataset(
+                root / "train", cfg, seconds=4.0
+            )
+            validation_manifest = create_synthetic_dataset(
+                root / "validation",
+                cfg,
+                seconds=4.0,
+                split="validation",
+                episode_id="synthetic-validation-001",
+            )
+            training_dataset, validation_dataset, _, _ = _build_training_datasets(
+                training_manifest,
+                validation_manifest,
+                cfg,
+                training_cfg,
+            )
+            self.assertGreater(len(training_dataset), 0)
+            self.assertGreater(len(validation_dataset), 0)
+
+            validation_payload = json.loads(
+                validation_manifest.read_text(encoding="utf-8")
+            )
+            validation_payload["split"] = "train"
+            validation_manifest.write_text(
+                json.dumps(validation_payload), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "split must be validation"):
+                _build_training_datasets(
+                    training_manifest,
+                    validation_manifest,
+                    cfg,
+                    training_cfg,
+                )
+
+            validation_payload["split"] = "validation"
+            validation_payload["episodes"][0]["id"] = "synthetic-001"
+            validation_manifest.write_text(
+                json.dumps(validation_payload), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "share episode ids"):
+                _build_training_datasets(
+                    training_manifest,
+                    validation_manifest,
+                    cfg,
+                    training_cfg,
+                )
 
     def test_manifest_validation_rejects_non_finite_telemetry(self) -> None:
         cfg = ModelConfig.tiny()
@@ -147,6 +225,8 @@ class TrainingPipelineTests(unittest.TestCase):
                 epoch_complete=False,
                 batches_completed_in_epoch=7,
                 data_loader_generator_state=generator_state,
+                best_validation_loss=0.75,
+                validation_metrics={"loss": 0.75, "movement_accuracy": 0.5},
             )
             target = HierarchicalImitationController(cfg)
             target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-4)
@@ -163,6 +243,10 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertIsNotNone(restored_generator_state)
             assert restored_generator_state is not None
             self.assertTrue(torch.equal(restored_generator_state, generator_state))
+            self.assertEqual(resume_state[4], 0.75)
+            self.assertEqual(
+                resume_state[5], {"loss": 0.75, "movement_accuracy": 0.5}
+            )
 
             mismatches = (
                 ({**axis_normalization, "scale_counts_per_second": [1.0, 2.0]}, "profile-a", telemetry, "axis normalization"),

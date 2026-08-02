@@ -50,8 +50,11 @@ one batch:
 
 ```powershell
 uv run overai-synthetic --output data/synthetic --seconds 4
+uv run overai-synthetic --output data/synthetic-validation --seconds 4 `
+  --split validation --episode-id synthetic-validation-001
 uv run overai-train `
   --manifest data/synthetic/manifest.json `
+  --validation-manifest data/synthetic-validation/manifest.json `
   --tiny `
   --history-seconds 0 `
   --optimization-seconds 1 `
@@ -192,6 +195,7 @@ The equivalent direct command is:
 ```powershell
 uv run overai-train `
   --manifest C:\Users\brand\Documents\overai\Overwatch\train\train.json `
+  --validation-manifest C:\Users\brand\Documents\overai\Overwatch\validation\validation.json `
   --model-config configs/rtx4080_1080p.json `
   --output runs/overwatch-4080 `
   --batch-size 1 `
@@ -217,10 +221,14 @@ Resume must keep the same model and dataset calibration. Add `-CompileVision`
 only after the first uncompiled run is stable; compilation increases startup
 time and can consume extra memory.
 
-Use a separate episode manifest for validation. Accuracy should include discrete
-class accuracy/F1, axis Huber error, derivative error, and held-out closed-loop
-gameplay scenarios. A decreasing imitation loss alone does not prove the agent
-can recover from its own mistakes.
+Use a separate episode manifest for validation. After every completed epoch, the
+trainer evaluates only that held-out manifest with gradients disabled. It writes
+training and validation metrics to `metrics.jsonl`, always updates
+`checkpoint_last.pt`, and updates `checkpoint_best.pt` only when validation loss
+improves. Reported metrics include discrete accuracy/F1, axis Huber and derivative
+losses, and immediate-axis MAE. Held-out closed-loop gameplay scenarios remain a
+separate final quality gate: decreasing imitation loss alone does not prove the
+agent can recover from its own mistakes.
 
 ## RTX 4080 deployment
 
