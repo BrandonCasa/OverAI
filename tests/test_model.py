@@ -48,7 +48,7 @@ class ControllerTests(unittest.TestCase):
         frame = torch.randint(
             0,
             256,
-            (1, 3, self.cfg.image_height, self.cfg.image_width),
+            (1, self.cfg.input_channels, self.cfg.image_height, self.cfg.image_width),
             dtype=torch.uint8,
         )
         output = self.model.on_video_frame(
@@ -98,7 +98,11 @@ class ControllerTests(unittest.TestCase):
     def test_memory_tier_schedule(self) -> None:
         state = self.model.initial_state(1, "cpu")
         frame = torch.zeros(
-            1, 3, self.cfg.image_height, self.cfg.image_width, dtype=torch.uint8
+            1,
+            self.cfg.input_channels,
+            self.cfg.image_height,
+            self.cfg.image_width,
+            dtype=torch.uint8,
         )
         for _ in range(4):
             output = self.model.on_video_frame(
@@ -118,7 +122,11 @@ class ControllerTests(unittest.TestCase):
         scheduler = RuntimeController(self.model)
         state = self.model.initial_state(1, "cpu")
         frame = torch.zeros(
-            1, 3, self.cfg.image_height, self.cfg.image_width, dtype=torch.uint8
+            1,
+            self.cfg.input_channels,
+            self.cfg.image_height,
+            self.cfg.image_width,
+            dtype=torch.uint8,
         )
         first = scheduler.step(frame, self.context, self.actions, self.timing, state)
         self.assertIsNotNone(first.discrete)

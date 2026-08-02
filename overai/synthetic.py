@@ -26,22 +26,27 @@ def create_synthetic_dataset(
     frame_count = math.ceil(fast_count / cfg.fast_ticks_per_video)
     slow_count = math.ceil(fast_count / cfg.fast_ticks_per_slow)
     episode_dir = output_dir / "episodes" / "synthetic-001"
-    frame_dir = episode_dir / "frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
+    red_frame_dir = episode_dir / "frames_r"
+    blue_frame_dir = episode_dir / "frames_b"
+    red_frame_dir.mkdir(parents=True, exist_ok=True)
+    blue_frame_dir.mkdir(parents=True, exist_ok=True)
 
     y = torch.linspace(0, 1, cfg.image_height).view(1, cfg.image_height, 1)
     x = torch.linspace(0, 1, cfg.image_width).view(1, 1, cfg.image_width)
     for index in range(frame_count):
         phase = index / max(frame_count - 1, 1)
-        frame = torch.cat(
-            (
-                (x.expand(1, cfg.image_height, -1) + phase).fmod(1.0),
-                (y.expand(1, -1, cfg.image_width) + phase * 0.5).fmod(1.0),
-                torch.full((1, cfg.image_height, cfg.image_width), phase),
-            ),
-            dim=0,
+        red = (x.expand(1, cfg.image_height, -1) + phase).fmod(1.0)
+        blue = (y.expand(1, -1, cfg.image_width) + phase * 0.5).fmod(1.0)
+        write_jpeg(
+            (red * 255).to(torch.uint8),
+            str(red_frame_dir / f"{index:06d}.jpg"),
+            quality=95,
         )
-        write_jpeg((frame * 255).to(torch.uint8), str(frame_dir / f"{index:06d}.jpg"))
+        write_jpeg(
+            (blue * 255).to(torch.uint8),
+            str(blue_frame_dir / f"{index:06d}.jpg"),
+            quality=95,
+        )
 
     fast_timestamps = torch.arange(fast_count, dtype=torch.float32) / cfg.fast_hz
     frame_timestamps = torch.arange(frame_count, dtype=torch.float32) / cfg.video_hz
@@ -87,10 +92,19 @@ def create_synthetic_dataset(
     torch.save(controls, controls_path)
     manifest = {
         "version": 2,
+        "split": "train",
+        "channels": ["R", "B"],
+        "control_profile_sha256": "synthetic-zero-profile",
+        "axis_normalization": {
+            "method": "synthetic",
+            "percentile": 99.5,
+            "scale_counts_per_second": [1.0, 1.0],
+        },
         "episodes": [
             {
                 "id": "synthetic-001",
-                "frames": "episodes/synthetic-001/frames",
+                "red_frames": "episodes/synthetic-001/frames_r",
+                "blue_frames": "episodes/synthetic-001/frames_b",
                 "controls": "episodes/synthetic-001/controls.pt",
             }
         ],

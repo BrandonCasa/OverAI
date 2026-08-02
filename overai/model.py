@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from .blocks import (
     MLP,
     CrossAttentionBlock,
+    ExportableLayerNorm,
     FourierTimeEmbedding,
     QueryCompressor,
     SpatialVisionBlock,
@@ -32,6 +33,27 @@ from .types import (
 )
 
 
+def _fixed_2d_position(height: int, width: int, dim: int) -> torch.Tensor:
+    if dim % 4:
+        raise ValueError("vision_dim must be divisible by four for 2D position encoding")
+    quarter = dim // 4
+    frequencies = torch.exp(
+        torch.arange(quarter, dtype=torch.float32)
+        * (-torch.log(torch.tensor(10_000.0)) / max(quarter - 1, 1))
+    )
+    rows = torch.arange(height, dtype=torch.float32).unsqueeze(1) * frequencies
+    columns = torch.arange(width, dtype=torch.float32).unsqueeze(1) * frequencies
+    row_encoding = torch.cat((rows.sin(), rows.cos()), dim=1)
+    column_encoding = torch.cat((columns.sin(), columns.cos()), dim=1)
+    return torch.cat(
+        (
+            row_encoding[:, None, :].expand(-1, width, -1),
+            column_encoding[None, :, :].expand(height, -1, -1),
+        ),
+        dim=-1,
+    ).unsqueeze(0)
+
+
 class SpatialVisionEncoder(nn.Module):
     """Encode a frame while preserving the configured spatial patch grid."""
 
@@ -39,13 +61,16 @@ class SpatialVisionEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.patch_projection = nn.Conv2d(
-            3, cfg.vision_dim, kernel_size=cfg.patch_size, stride=cfg.patch_size
+            cfg.input_channels,
+            cfg.vision_dim,
+            kernel_size=cfg.patch_size,
+            stride=cfg.patch_size,
         )
-        self.row_embedding = nn.Parameter(
-            torch.randn(1, cfg.grid_height, 1, cfg.vision_dim) * 0.02
-        )
-        self.column_embedding = nn.Parameter(
-            torch.randn(1, 1, cfg.grid_width, cfg.vision_dim) * 0.02
+        self.position_encoding: torch.Tensor
+        self.register_buffer(
+            "position_encoding",
+            _fixed_2d_position(cfg.grid_height, cfg.grid_width, cfg.vision_dim),
+            persistent=True,
         )
         self.blocks = nn.ModuleList(
             SpatialVisionBlock(
@@ -53,17 +78,22 @@ class SpatialVisionEncoder(nn.Module):
                 cfg.num_heads,
                 cfg.window_height,
                 cfg.window_width,
+                cfg.grid_height,
+                cfg.grid_width,
                 shifted=bool(index % 2),
                 dropout=cfg.dropout,
             )
             for index in range(cfg.vision_layers)
         )
         self.output_projection = nn.Linear(cfg.vision_dim, cfg.model_dim)
-        self.output_norm = nn.LayerNorm(cfg.model_dim)
+        self.output_norm = ExportableLayerNorm(cfg.model_dim)
 
     def forward(self, frame: torch.Tensor) -> torch.Tensor:
-        if frame.ndim != 4 or frame.shape[1] != 3:
-            raise ValueError(f"expected BCHW RGB frame, got shape {tuple(frame.shape)}")
+        if frame.ndim != 4 or frame.shape[1] != self.cfg.input_channels:
+            raise ValueError(
+                f"expected BCHW {self.cfg.channel_order} frame, got shape "
+                f"{tuple(frame.shape)}"
+            )
         if frame.shape[-2:] != (self.cfg.image_height, self.cfg.image_width):
             raise ValueError(
                 "frame dimensions do not match config: "
@@ -72,7 +102,7 @@ class SpatialVisionEncoder(nn.Module):
             )
 
         if frame.dtype == torch.uint8:
-            frame = frame.float().div_(127.5).sub_(1.0)
+            frame = frame.to(dtype=self.patch_projection.weight.dtype).div_(127.5).sub_(1.0)
         elif not torch.is_floating_point(frame):
             raise TypeError("frames must be uint8 or floating point")
         else:
@@ -80,7 +110,7 @@ class SpatialVisionEncoder(nn.Module):
 
         patches = self.patch_projection(frame)
         grid = patches.permute(0, 2, 3, 1)
-        grid = grid + self.row_embedding + self.column_embedding
+        grid = grid + self.position_encoding.to(dtype=grid.dtype)
         for block in self.blocks:
             if self.cfg.gradient_checkpointing and self.training and grid.requires_grad:
                 grid = checkpoint(block, grid, use_reentrant=False)
@@ -118,8 +148,9 @@ class ExecutedActionEncoder(nn.Module):
 
     def forward(self, actions: ExecutedActions) -> torch.Tensor:
         movement = self.movement_embedding(actions.movement.long()).flatten(-2)
-        buttons = self.buttons_encoder(actions.buttons.float())
-        axes = self.axes_encoder(actions.axes.float())
+        dtype = self.movement_embedding.weight.dtype
+        buttons = self.buttons_encoder(actions.buttons.to(dtype=dtype))
+        axes = self.axes_encoder(actions.axes.to(dtype=dtype))
         return self.output(torch.cat((movement, buttons, axes), dim=-1))
 
 
@@ -330,7 +361,7 @@ class SharedStateFusion(nn.Module):
             CrossAttentionBlock(cfg.model_dim, cfg.num_heads, cfg.dropout)
             for _ in range(2)
         )
-        self.output_norm = nn.LayerNorm(cfg.model_dim)
+        self.output_norm = ExportableLayerNorm(cfg.model_dim)
 
     def forward(
         self,

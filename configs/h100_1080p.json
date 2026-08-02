@@ -1,6 +1,8 @@
 {
   "image_height": 1080,
   "image_width": 1920,
+  "input_channels": 2,
+  "channel_order": "RB",
   "patch_size": 40,
   "grid_height": 27,
   "grid_width": 48,

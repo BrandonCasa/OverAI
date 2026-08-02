@@ -43,7 +43,7 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertFalse(torch.equal(first_context.health, next_context.health))
             self.assertEqual(
                 tuple(batch.load_frame(0, torch.device("cpu")).shape),
-                (1, 3, cfg.image_height, cfg.image_width),
+                (1, 2, cfg.image_height, cfg.image_width),
             )
             later_batch = dataset.collate([dataset[1]])
             previous = later_batch.executed_actions(0, torch.device("cpu"))

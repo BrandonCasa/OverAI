@@ -50,7 +50,12 @@ def main() -> None:
     cfg = model.cfg
     state = model.initial_state(1, device)
     frame = torch.zeros(
-        1, 3, cfg.image_height, cfg.image_width, dtype=torch.uint8, device=device
+        1,
+        cfg.input_channels,
+        cfg.image_height,
+        cfg.image_width,
+        dtype=torch.uint8,
+        device=device,
     )
     zero = lambda width: torch.zeros(1, width, device=device)
     context = ObservationContext(zero(1), zero(1), zero(1), zero(1))

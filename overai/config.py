@@ -18,6 +18,8 @@ class ModelConfig:
 
     image_height: int = 1080
     image_width: int = 1920
+    input_channels: int = 2
+    channel_order: str = "RB"
     patch_size: int = 40
     grid_height: int = 27
     grid_width: int = 48
@@ -61,6 +63,7 @@ class ModelConfig:
         positive_fields = (
             "image_height",
             "image_width",
+            "input_channels",
             "patch_size",
             "grid_height",
             "grid_width",
@@ -108,6 +111,8 @@ class ModelConfig:
                 "grid dimensions must match image dimensions divided by patch_size: "
                 f"expected {expected_grid}, got {(self.grid_height, self.grid_width)}"
             )
+        if self.input_channels != 2 or self.channel_order != "RB":
+            raise ValueError("OverAI requires two input channels in RB order")
         if self.fast_hz % self.video_hz:
             raise ValueError("fast_hz must be an integer multiple of video_hz")
         if self.fast_hz % self.slow_hz:

@@ -40,7 +40,7 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 @dataclass(frozen=True, slots=True)
 class EpisodeRecord:
     episode_id: str
-    frame_paths: tuple[Path, ...]
+    frame_pairs: tuple[tuple[Path, Path], ...]
     controls_path: Path
     fast_count: int
     slow_count: int
@@ -48,7 +48,7 @@ class EpisodeRecord:
 
 @dataclass(slots=True)
 class SequenceBatch:
-    frame_paths: list[list[Path]]
+    frame_pairs: list[list[tuple[Path, Path]]]
     fast_timestamps: torch.Tensor
     frame_timestamps: torch.Tensor
     slow_timestamps: torch.Tensor
@@ -79,11 +79,13 @@ class SequenceBatch:
         return self.history_ticks + self.optimization_ticks
 
     def load_frame(self, frame_index: int, device: torch.device) -> torch.Tensor:
-        frames = [
-            decode_image(str(paths[frame_index]), mode=ImageReadMode.RGB)
-            for paths in self.frame_paths
-        ]
-        expected = (3, self.image_height, self.image_width)
+        frames = []
+        for pairs in self.frame_pairs:
+            red_path, blue_path = pairs[frame_index]
+            red = decode_image(str(red_path), mode=ImageReadMode.GRAY)
+            blue = decode_image(str(blue_path), mode=ImageReadMode.GRAY)
+            frames.append(torch.cat((red, blue), dim=0))
+        expected = (2, self.image_height, self.image_width)
         for frame in frames:
             if tuple(frame.shape) != expected:
                 raise ValueError(
@@ -223,6 +225,23 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
         raise TypeError("dataset manifest must be an object")
     if data.get("version") != 2:
         raise ValueError("dataset manifest must have version 2")
+    if data.get("channels") != ["R", "B"]:
+        raise ValueError("dataset manifest channels must be ['R', 'B']")
+    if data.get("split") not in {"train", "validation"}:
+        raise ValueError("dataset manifest split must be train or validation")
+    profile_hash = data.get("control_profile_sha256")
+    if not isinstance(profile_hash, str) or not profile_hash:
+        raise ValueError("dataset manifest must contain a control profile hash")
+    normalization = data.get("axis_normalization")
+    if not isinstance(normalization, dict):
+        raise TypeError("dataset manifest axis_normalization must be an object")
+    scales = normalization.get("scale_counts_per_second")
+    if (
+        not isinstance(scales, list)
+        or len(scales) != 2
+        or any(not isinstance(value, (int, float)) or value <= 0 for value in scales)
+    ):
+        raise ValueError("axis normalization must contain two positive scales")
     episodes = data.get("episodes")
     if not isinstance(episodes, list):
         raise TypeError("dataset manifest episodes must be a list")
@@ -240,26 +259,48 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
         if not episode_id or episode_id in seen_ids:
             raise ValueError("episode ids must be non-empty and unique")
         seen_ids.add(episode_id)
-        frame_dir = (manifest_path.parent / str(item.get("frames", ""))).resolve()
+        red_frame_dir = (
+            manifest_path.parent / str(item.get("red_frames", ""))
+        ).resolve()
+        blue_frame_dir = (
+            manifest_path.parent / str(item.get("blue_frames", ""))
+        ).resolve()
         controls_path = (manifest_path.parent / str(item.get("controls", ""))).resolve()
-        if not frame_dir.is_dir():
-            raise FileNotFoundError(f"frame directory does not exist: {frame_dir}")
+        if not red_frame_dir.is_dir():
+            raise FileNotFoundError(f"red frame directory does not exist: {red_frame_dir}")
+        if not blue_frame_dir.is_dir():
+            raise FileNotFoundError(
+                f"blue frame directory does not exist: {blue_frame_dir}"
+            )
         if not controls_path.is_file():
             raise FileNotFoundError(f"controls file does not exist: {controls_path}")
-        frame_paths = tuple(
-            sorted(
-                path
-                for path in frame_dir.iterdir()
-                if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        def channel_paths(directory: Path) -> tuple[Path, ...]:
+            return tuple(
+                sorted(
+                    candidate
+                    for candidate in directory.iterdir()
+                    if candidate.is_file()
+                    and candidate.suffix.lower() in IMAGE_SUFFIXES
+                )
             )
-        )
+
+        red_paths = channel_paths(red_frame_dir)
+        blue_paths = channel_paths(blue_frame_dir)
+        if len(red_paths) != len(blue_paths):
+            raise ValueError(
+                f"{episode_id}: red/blue frame counts differ: "
+                f"{len(red_paths)} != {len(blue_paths)}"
+            )
+        if [path.name for path in red_paths] != [path.name for path in blue_paths]:
+            raise ValueError(f"{episode_id}: red/blue frame names do not match")
+        frame_pairs = tuple(zip(red_paths, blue_paths, strict=True))
         controls = _load_controls(controls_path)
         fast_count, slow_count = _validate_controls(
-            controls_path, controls, len(frame_paths), cfg
+            controls_path, controls, len(frame_pairs), cfg
         )
         records.append(
             EpisodeRecord(
-                episode_id, frame_paths, controls_path, fast_count, slow_count
+                episode_id, frame_pairs, controls_path, fast_count, slow_count
             )
         )
     return records
@@ -334,7 +375,7 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
         slow_end = last_slow + self.cfg.slow_horizon
 
         return {
-            "frame_paths": list(record.frame_paths[base_frame:frame_end]),
+            "frame_pairs": list(record.frame_pairs[base_frame:frame_end]),
             "fast_timestamps": controls["fast_timestamps"][base_tick:fast_end],
             "frame_timestamps": controls["frame_timestamps"][base_frame:frame_end],
             "slow_timestamps": controls["slow_timestamps"][base_slow:slow_end],
@@ -358,7 +399,7 @@ class DemonstrationWindowDataset(Dataset[dict[str, Any]]):
             return torch.stack([sample[key] for sample in samples])
 
         return SequenceBatch(
-            frame_paths=[sample["frame_paths"] for sample in samples],
+            frame_pairs=[sample["frame_pairs"] for sample in samples],
             fast_timestamps=stack("fast_timestamps"),
             frame_timestamps=stack("frame_timestamps"),
             slow_timestamps=stack("slow_timestamps"),
@@ -386,7 +427,7 @@ def dataset_summary(path: str | Path, cfg: ModelConfig) -> dict[str, int]:
     records = load_manifest(path, cfg)
     return {
         "episodes": len(records),
-        "frames": sum(len(record.frame_paths) for record in records),
+        "frames": sum(len(record.frame_pairs) for record in records),
         "fast_ticks": sum(record.fast_count for record in records),
         "slow_ticks": sum(record.slow_count for record in records),
     }

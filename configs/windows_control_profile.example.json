@@ -1,0 +1,27 @@
+{
+  "window": {
+    "process_name": "game.exe",
+    "title_regex": "^Game Title(?:$| - )"
+  },
+  "movement": {
+    "left": "A",
+    "right": "D",
+    "forward": "W",
+    "reverse": "S"
+  },
+  "buttons": [
+    "MOUSE1",
+    "MOUSE2",
+    "SPACE",
+    "E",
+    "Q",
+    "SHIFT"
+  ],
+  "pause_key": "F8",
+  "emergency_stop_key": "F9",
+  "invert_axes": [
+    false,
+    false
+  ],
+  "telemetry_provider": "zero"
+}

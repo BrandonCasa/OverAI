@@ -230,14 +230,18 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     training_cfg: TrainingConfig,
+    axis_normalization: dict[str, Any],
+    control_profile_sha256: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format_version": 2,
+            "format_version": 3,
             "model_config": model.cfg.to_dict(),
             "training_config": asdict(training_cfg),
+            "axis_normalization": axis_normalization,
+            "control_profile_sha256": control_profile_sha256,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
@@ -256,7 +260,7 @@ def load_checkpoint(
     checkpoint_data: dict[str, Any] = torch.load(
         path, map_location="cpu", weights_only=True
     )
-    if checkpoint_data.get("format_version") != 2:
+    if checkpoint_data.get("format_version") != 3:
         raise ValueError("unsupported checkpoint format")
     if checkpoint_data.get("model_config") != model.cfg.to_dict():
         raise ValueError("checkpoint model configuration does not match")
@@ -289,6 +293,11 @@ def run_training(
     if not torch.cuda.is_available():
         raise RuntimeError("training requires an NVIDIA CUDA device")
     device = torch.device("cuda")
+    device_name = torch.cuda.get_device_name(0)
+    if "H100" not in device_name:
+        raise RuntimeError(f"production training requires an NVIDIA H100; found {device_name}")
+    if not training_cfg.bf16:
+        raise RuntimeError("production H100 training requires BF16 autocast")
     if training_cfg.bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("the selected CUDA device does not support bfloat16")
     configure_runtime(device, training_cfg.seed)
@@ -300,6 +309,13 @@ def run_training(
         optimization_seconds=training_cfg.optimization_seconds,
         stride_seconds=training_cfg.stride_seconds,
     )
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    axis_normalization = manifest_payload.get("axis_normalization")
+    if not isinstance(axis_normalization, dict):
+        raise TypeError("training manifest is missing axis_normalization")
+    control_profile_sha256 = manifest_payload.get("control_profile_sha256")
+    if not isinstance(control_profile_sha256, str) or not control_profile_sha256:
+        raise TypeError("training manifest is missing control_profile_sha256")
     generator = torch.Generator().manual_seed(training_cfg.seed)
     loader = DataLoader(
         dataset,
@@ -365,6 +381,8 @@ def run_training(
                     epoch,
                     global_step,
                     training_cfg,
+                    axis_normalization,
+                    control_profile_sha256,
                 )
             if max_batches is not None and batch_index + 1 >= max_batches:
                 break
@@ -381,6 +399,8 @@ def run_training(
             epoch,
             global_step,
             training_cfg,
+            axis_normalization,
+            control_profile_sha256,
         )
 
 

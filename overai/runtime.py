@@ -22,7 +22,7 @@ class GameAdapter(ABC):
 
     @abstractmethod
     def capture_frame(self) -> torch.Tensor:
-        """Return an RGB uint8 CHW frame at the configured resolution."""
+        """Return an RB uint8 CHW frame at the configured resolution."""
 
     @abstractmethod
     def observation(self) -> ObservationContext:
@@ -68,7 +68,7 @@ def load_controller_checkpoint(
     device: torch.device | str = "cuda",
 ) -> HierarchicalImitationController:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if payload.get("format_version") != 2:
+    if payload.get("format_version") != 3:
         raise ValueError("unsupported checkpoint format")
     cfg = ModelConfig(**payload["model_config"])
     model = HierarchicalImitationController(cfg)
