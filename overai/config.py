@@ -12,17 +12,18 @@ from typing import Any
 class ModelConfig:
     """Configuration for the hierarchical imitation controller.
 
-    Defaults implement the uploaded 1080p, 30/5/60 Hz architecture.  Tests and
+    Defaults implement the 720p, 30/5/60 Hz architecture for the current
+    two-channel visual input and eight-button control profile. Tests and
     experiments can use smaller, structurally identical configurations.
     """
 
-    image_height: int = 1080
-    image_width: int = 1920
+    image_height: int = 720
+    image_width: int = 1280
     input_channels: int = 2
     channel_order: str = "RB"
     patch_size: int = 40
-    grid_height: int = 27
-    grid_width: int = 48
+    grid_height: int = 18
+    grid_width: int = 32
 
     video_hz: int = 30
     slow_hz: int = 5
@@ -30,34 +31,34 @@ class ModelConfig:
     slow_horizon: int = 10
     fast_horizon: int = 120
 
-    vision_dim: int = 384
-    model_dim: int = 512
-    controller_dim: int = 512
-    vision_layers: int = 8
-    fusion_layers: int = 4
-    decoder_layers: int = 3
+    vision_dim: int = 256
+    model_dim: int = 320
+    controller_dim: int = 320
+    vision_layers: int = 4
+    fusion_layers: int = 2
+    decoder_layers: int = 1
     num_heads: int = 8
 
-    window_height: int = 9
+    window_height: int = 6
     window_width: int = 8
-    dropout: float = 0.0
+    dropout: float = 0.1
     gradient_checkpointing: bool = True
 
-    frame_summary_tokens: int = 8
+    frame_summary_tokens: int = 4
     recent_entries: int = 60
     intermediate_entries: int = 40
     long_entries: int = 20
-    recent_tokens_per_entry: int = 8
-    intermediate_tokens_per_entry: int = 4
-    long_tokens_per_entry: int = 4
+    recent_tokens_per_entry: int = 4
+    intermediate_tokens_per_entry: int = 2
+    long_tokens_per_entry: int = 2
     frames_per_intermediate: int = 6
     intermediate_per_long: int = 5
 
-    control_query_tokens: int = 16
-    action_dim: int = 128
-    trajectory_summary_tokens: int = 8
-    num_buttons: int = 6
-    compressor_layers: int = 2
+    control_query_tokens: int = 12
+    action_dim: int = 96
+    trajectory_summary_tokens: int = 4
+    num_buttons: int = 8
+    compressor_layers: int = 1
 
     def __post_init__(self) -> None:
         positive_fields = (
@@ -119,6 +120,10 @@ class ModelConfig:
             raise ValueError("fast_hz must be an integer multiple of slow_hz")
         if self.model_dim % self.num_heads or self.vision_dim % self.num_heads:
             raise ValueError("model_dim and vision_dim must be divisible by num_heads")
+        if self.vision_dim % 4:
+            raise ValueError("vision_dim must be divisible by four")
+        if self.window_height > self.grid_height or self.window_width > self.grid_width:
+            raise ValueError("attention windows cannot exceed the patch grid")
         if self.frame_summary_tokens != self.recent_tokens_per_entry:
             raise ValueError(
                 "frame_summary_tokens and recent_tokens_per_entry describe the same "
@@ -186,6 +191,7 @@ class ModelConfig:
             num_heads=4,
             window_height=2,
             window_width=3,
+            dropout=0.0,
             gradient_checkpointing=False,
             frame_summary_tokens=2,
             recent_entries=4,

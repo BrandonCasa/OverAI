@@ -607,7 +607,7 @@ def record_main() -> None:
     parser.add_argument("--episode-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--duration", type=float)
-    parser.add_argument("--model-config", type=Path, default=Path("configs/h100_1080p.json"))
+    parser.add_argument("--model-config", type=Path, default=Path("configs/h100_720p.json"))
     args = parser.parse_args()
     profile = ControlProfile.from_json(args.profile)
     cfg = ModelConfig.from_json(args.model_config)

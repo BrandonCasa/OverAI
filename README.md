@@ -7,8 +7,8 @@ Q-learning, or online exploration.
 
 The default model is the uploaded specification:
 
-- 1920×1080 planar red/blue input split into 40×40 patches, preserving a 48×27 grid; green is never reconstructed
-- shifted 9×8 local-window vision attention instead of quadratic global attention
+- 1280×720 planar red/blue input split into 40×40 patches, preserving a 32×18 grid; green is never reconstructed
+- four shifted-window vision blocks with 6×8 local attention instead of quadratic global attention
 - causal memory covering roughly 30 seconds at recent, intermediate, and long rates
 - two-dimensional discrete movement and configurable button-state control at 5 Hz
 - two bounded continuous axes at 60 Hz
@@ -36,7 +36,7 @@ offline or private-LAN games where automation is permitted.
 ```powershell
 uv sync
 uv run python -m unittest discover -v
-uv run overai-benchmark --model-config configs/rtx4080_1080p.json
+uv run overai-benchmark --model-config configs/rtx4080_720p.json
 ```
 
 RTX deployment needs Python 3.13 because the TensorRT-RTX wheel does not support
@@ -114,11 +114,11 @@ Before committing to a long GPU run, validate each split independently:
 ```powershell
 uv run overai-train `
   --manifest D:\datasets\doom\train.json `
-  --model-config configs/rtx4080_1080p.json `
+  --model-config configs/rtx4080_720p.json `
   --validate-only
 uv run overai-train `
   --manifest D:\datasets\doom\validation.json `
-  --model-config configs/rtx4080_1080p.json `
+  --model-config configs/rtx4080_720p.json `
   --validate-only
 ```
 
@@ -147,7 +147,17 @@ and deployment.
 
 ## Local RTX 4080 training
 
-The RTX 4080 profile preserves the 1080p model shape. The Overwatch command uses
+The RTX 4080 profile uses 720p input with 576 visual tokens, down from 1,296 at
+1080p. Its four 256-wide vision blocks and 6×8 windows keep the visual path local
+and efficient. The 320-wide shared/controller state retains capacity for temporal
+reasoning, while 12 shared queries correspond to the current 2-axis movement,
+8-button, and 2-axis continuous interface. Memory keeps the same roughly 30-second
+time span with 360 compressed tokens instead of 720, and the two-second output
+horizons use one decoder block. This reduces the model from 34.3M to 24.3M
+parameters while preserving the input channels, control targets, and horizons.
+The H100 profile uses the same learned architecture for checkpoint portability,
+but disables gradient checkpointing to favor throughput on the larger-memory GPU.
+The Overwatch command uses
 5 seconds of causal warm-up while optimizing two seconds at a time so the
 current episode lengths contribute useful windows.
 Warm-up is excluded from the gradient tape; the hierarchical memory still
@@ -175,7 +185,7 @@ The equivalent direct command is:
 uv run overai-train `
   --manifest C:\Users\brand\Documents\overai\Overwatch\train\train.json `
   --validation-manifest C:\Users\brand\Documents\overai\Overwatch\validation\validation.json `
-  --model-config configs/rtx4080_1080p.json `
+  --model-config configs/rtx4080_720p.json `
   --output runs/overwatch-4080 `
   --batch-size 1 `
   --epochs 20 `
@@ -248,7 +258,7 @@ Toolkit 13.2, and Visual Studio C++ Build Tools.
 
 Subclass `GameAdapter` with five operations:
 
-1. capture a 1080p planar R/B frame;
+1. capture a 720p planar R/B frame;
 2. expose the four causal context values;
 3. report the previously executed controls;
 4. apply two continuous axes;
