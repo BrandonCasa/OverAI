@@ -4,23 +4,45 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv is required. Install it from https://docs.astral.sh/uv/ first."
 }
 
-$nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
-if (-not $nvcc) {
-    throw "CUDA Toolkit 13.2 with nvcc on PATH is required. Install NVIDIA's pinned 13.2 Windows toolkit, then rerun this script."
+$cudaRoot = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match "^v13\.(?:[2-9]|[1-9]\d)" -and (Test-Path (Join-Path $_.FullName "bin\nvcc.exe")) } |
+    Sort-Object Name -Descending |
+    Select-Object -First 1
+if (-not $cudaRoot) {
+    throw "CUDA Toolkit 13.2 or newer 13.x with nvcc is required."
 }
-$cudaVersion = & $nvcc.Source --version
-if ($cudaVersion -notmatch "release 13\.2") {
-    throw "CUDA Toolkit 13.2 is required; nvcc reported a different release."
+$env:PATH = "$(Join-Path $cudaRoot.FullName 'bin');$env:PATH"
+$cudaVersion = (& (Join-Path $cudaRoot.FullName "bin\nvcc.exe") --version) -join "`n"
+if ($cudaVersion -notmatch "release 13\.(?:[2-9]|[1-9]\d)") {
+    throw "CUDA Toolkit 13.2 or newer 13.x is required; nvcc reported a different release."
 }
 
-if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
-    throw "Visual Studio 2022 C++ Build Tools are required. Install the Desktop development with C++ workload, then run this from its Developer PowerShell."
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) {
+    throw "Visual Studio C++ Build Tools are required. Install the Desktop development with C++ workload."
 }
-
-foreach ($tool in @("cmake", "ninja")) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        throw "$tool is required and must be on PATH."
+$vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vsDevCmd = Join-Path $vsInstall "Common7\Tools\VsDevCmd.bat"
+if (-not $vsInstall -or -not (Test-Path $vsDevCmd)) {
+    throw "Visual Studio C++ Build Tools with the Desktop development with C++ workload are required."
+}
+cmd.exe /c "`"$vsDevCmd`" -no_logo -arch=x64 && set" | ForEach-Object {
+    if ($_ -match "^([^=]+)=(.*)$") {
+        Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
     }
+}
+
+$toolPaths = @(
+    "C:\Program Files\CMake\bin",
+    (Join-Path $vsInstall "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja")
+)
+foreach ($toolPath in $toolPaths) {
+    if (Test-Path $toolPath) {
+        $env:PATH = "$toolPath;$env:PATH"
+    }
+}
+foreach ($tool in @("cmake", "ninja", "cl")) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is required but was not found after toolchain setup." }
 }
 
 $env:UV_PROJECT_ENVIRONMENT = ".venv-rtx"

@@ -40,9 +40,10 @@ uv run overai-benchmark --model-config configs/h100_1080p.json
 ```
 
 RTX deployment needs Python 3.13 because the TensorRT-RTX wheel does not support
-Python 3.14. After installing CUDA Toolkit 13.2, Visual Studio C++ Build Tools,
-CMake/Ninja, TensorRT-RTX prerequisites, and Nsight Systems, provision the isolated
-environment with `scripts/setup-rtx4080.ps1`. The script refuses a non-RTX-4080 GPU.
+Python 3.14. After installing CUDA Toolkit 13.2 or newer 13.x, Visual Studio C++ Build
+Tools, CMake/Ninja, TensorRT-RTX prerequisites, and Nsight Systems, provision the
+isolated environment with `scripts/setup-rtx4080.ps1`. The script locates those tools
+itself and refuses a non-RTX-4080 GPU.
 
 For a quick end-to-end plumbing test, create a tiny synthetic episode and train
 one batch:
