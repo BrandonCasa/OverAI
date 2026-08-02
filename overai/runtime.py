@@ -85,11 +85,11 @@ def run_realtime(
 ) -> None:
     """Run scheduled 60 Hz control until duration expires or interrupted."""
 
-    device = torch.device(device)
-    if device.type == "cuda" and not torch.cuda.is_available():
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA runtime is unavailable")
     scheduler = RuntimeController(model)
-    state = model.initial_state(1, device)
+    state = model.initial_state(1, resolved_device)
     cfg = model.cfg
     start = time.perf_counter()
     tick = 0
@@ -115,31 +115,35 @@ def run_realtime(
             frame = None
             if video_due:
                 frame = (
-                    adapter.capture_frame().unsqueeze(0).to(device, non_blocking=True)
+                    adapter.capture_frame()
+                    .unsqueeze(0)
+                    .to(resolved_device, non_blocking=True)
                 )
                 last_frame_time = now
             if slow_due:
                 last_slow_time = now
-                context = _batch_context(adapter.observation(), device)
+                context = _batch_context(adapter.observation(), resolved_device)
 
             timing = TimingContext(
-                absolute_time=torch.tensor([[now - start]], device=device),
+                absolute_time=torch.tensor([[now - start]], device=resolved_device),
                 since_video_frame=torch.tensor(
-                    [[now - last_frame_time]], device=device
+                    [[now - last_frame_time]], device=resolved_device
                 ),
-                since_slow_update=torch.tensor([[now - last_slow_time]], device=device),
+                since_slow_update=torch.tensor(
+                    [[now - last_slow_time]], device=resolved_device
+                ),
                 fast_delta_time=torch.tensor(
-                    [[now - previous_tick_time]], device=device
+                    [[now - previous_tick_time]], device=resolved_device
                 ),
             )
             if context is None:
                 raise RuntimeError("observation context was not initialized")
-            actions = _batch_actions(adapter.executed_actions(), device)
-            autocast_enabled = use_bf16 and device.type == "cuda"
+            actions = _batch_actions(adapter.executed_actions(), resolved_device)
+            autocast_enabled = use_bf16 and resolved_device.type == "cuda"
             with (
                 torch.inference_mode(),
                 torch.autocast(
-                    device_type=device.type,
+                    device_type=resolved_device.type,
                     dtype=torch.bfloat16,
                     enabled=autocast_enabled,
                 ),
