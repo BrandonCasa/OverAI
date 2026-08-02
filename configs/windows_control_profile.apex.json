@@ -1,0 +1,28 @@
+{
+  "window": {
+    "process_name": "r5apex_dx12.exe",
+    "title_regex": "^Apex Legends(?:$| - )"
+  },
+  "movement": {
+    "left": "A",
+    "right": "D",
+    "forward": "W",
+    "reverse": "S"
+  },
+  "buttons": [
+    "MOUSE1",
+    "MOUSE2",
+    "MOUSE5",
+    "SPACE",
+    "SHIFT",
+    "E",
+    "R",
+    "Q"
+  ],
+  "pause_key": "F8",
+  "emergency_stop_key": "F9",
+  "invert_axes": [
+    false,
+    false
+  ]
+}

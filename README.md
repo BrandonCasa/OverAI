@@ -139,11 +139,13 @@ in the model config, pause/emergency keys, and axis inversion.
 .venv\Scripts\overai-finalize-dataset.exe --train D:\overai\train --validation D:\overai\validation
 ```
 
-Focus loss, pause, emergency stop, timing gaps, resize/capture loss, or capture
-closure ends a segment. JPEG encoding runs off the capture loop. Only validated
-episodes are added atomically to manifests. Axis scales are the 99.5th percentile
-of nonzero absolute training counts/second and are frozen for validation, training,
-and deployment.
+Focus loss, pause, emergency stop, persistent timing gaps, or capture closure ends
+a segment. Compatible source-resolution changes are normalized to the configured
+model size. A brief missed capture callback reuses the last valid frame for at most
+0.25 seconds; `reused_video_frames` records the exact count in `episode.json`.
+JPEG encoding runs off the capture loop. Only validated episodes are added
+atomically to manifests. Axis scales are the 99.5th percentile of nonzero absolute
+training counts/second and are frozen for validation, training, and deployment.
 
 ## Local RTX 4080 training
 

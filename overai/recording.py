@@ -23,6 +23,8 @@ from .config import ModelConfig
 
 
 _ENCODER_STALL_BUDGET_SECONDS = 2.0
+_CAPTURE_REUSE_BUDGET_SECONDS = 0.25
+_TIMING_GAP_BUDGET_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +250,22 @@ class EpisodeRecorder:
         y = 1 if reverse == forward else (0 if reverse else 2)
         return x, y
 
+    def _emergency_stop_reason(self) -> str:
+        reason_provider = getattr(self.backend, "emergency_stop_reason", None)
+        if callable(reason_provider):
+            reason = reason_provider()
+            if isinstance(reason, str) and reason:
+                return reason
+        return "emergency_stop"
+
+    def _capture_timeout_reason(self) -> str:
+        reason_provider = getattr(self.backend, "capture_interruption_reason", None)
+        if callable(reason_provider):
+            reason = reason_provider()
+            if isinstance(reason, str) and reason:
+                return reason
+        return "capture_frame_timeout"
+
     def record(self, duration_seconds: float | None) -> Path:
         final_dir = self.output_dir / "episodes" / self.episode_id
         temporary_dir = final_dir.with_name(final_dir.name + ".recording")
@@ -360,17 +378,24 @@ class EpisodeRecorder:
         else:
             start = time.perf_counter()
         previous_fast = start
+        schedule_start = start
         frame_index = 0
         fast_index = 0
         capture_timeout_ms = max(1, math.ceil(1000 / self.cfg.video_hz))
+        maximum_reused_frames = max(
+            1, math.ceil(self.cfg.video_hz * _CAPTURE_REUSE_BUDGET_SECONDS)
+        )
+        consecutive_reused_frames = 0
+        reused_video_frames = 0
+        last_frame: torch.Tensor | None = None
         failure: BaseException | None = None
         termination_reason: str | None = None
         try:
             while maximum_ticks is None or fast_index < maximum_ticks:
                 if self.backend.emergency_stop_requested():
-                    termination_reason = "emergency_stop"
+                    termination_reason = self._emergency_stop_reason()
                     break
-                deadline = start + fast_index / self.cfg.fast_hz
+                deadline = schedule_start + fast_index / self.cfg.fast_hz
                 remaining = deadline - time.perf_counter()
                 if remaining > 0:
                     time.sleep(remaining)
@@ -382,9 +407,15 @@ class EpisodeRecorder:
                 if self.profile.pause_key in held:
                     termination_reason = "pause_key"
                     break
-                if now - deadline > 2.0 / self.cfg.fast_hz:
+                lateness = now - deadline
+                if lateness > _TIMING_GAP_BUDGET_SECONDS:
                     termination_reason = "timing_gap"
                     break
+                if lateness > 2.0 / self.cfg.fast_hz:
+                    # Preserve the real elapsed timestamps/duration, but move
+                    # future deadlines forward so a brief OS stall does not
+                    # cause a burst of artificial catch-up samples.
+                    schedule_start += lateness
                 fast_timestamps.append(now - start)
                 fast_durations.append(max(now - previous_fast, 1.0 / self.cfg.fast_hz))
                 fast_deltas.append(self.backend.drain_mouse_deltas(previous_fast, now))
@@ -400,11 +431,22 @@ class EpisodeRecorder:
                             timeout_ms=capture_timeout_ms
                         )
                         if captured is None:
-                            raise RuntimeError(
-                                "no fresh Windows Graphics Capture frame within "
-                                f"{capture_timeout_ms} ms at video frame {frame_index}"
-                            )
-                        captured_frame = captured
+                            if self.backend.emergency_stop_requested():
+                                termination_reason = self._emergency_stop_reason()
+                                break
+                            consecutive_reused_frames += 1
+                            if consecutive_reused_frames > maximum_reused_frames:
+                                termination_reason = self._capture_timeout_reason()
+                                break
+                            if last_frame is None:
+                                raise RuntimeError(
+                                    "Windows Graphics Capture lost its initial frame"
+                                )
+                            captured_frame = (time.perf_counter(), last_frame)
+                            reused_video_frames += 1
+                        else:
+                            captured_frame = captured
+                            consecutive_reused_frames = 0
                     captured_at, frame = captured_frame
                     if fast_index == 0:
                         captured_at = start
@@ -414,6 +456,7 @@ class EpisodeRecorder:
                         self.cfg.image_width,
                     ) or frame.dtype != torch.uint8:
                         raise ValueError("native capture returned an invalid RB frame")
+                    last_frame = frame
                     enqueue_frame(_EncodedFrame(frame_index, frame.cpu()))
                     frame_timestamps.append(captured_at - start)
                     frame_index += 1
@@ -459,6 +502,7 @@ class EpisodeRecorder:
             "profile_sha256": self.profile.sha256(),
             "termination_reason": termination_reason,
             "duration_seconds": float(fast_timestamps[-1]),
+            "reused_video_frames": reused_video_frames,
             "finalized": False,
         }
         (temporary_dir / "episode.json").write_text(
@@ -640,7 +684,8 @@ def record_main() -> None:
     print(
         "recording stopped: "
         f"reason={metadata['termination_reason']} "
-        f"duration={metadata['duration_seconds']:.3f}s"
+        f"duration={metadata['duration_seconds']:.3f}s "
+        f"reused_frames={metadata['reused_video_frames']}"
     )
     print(episode)
 

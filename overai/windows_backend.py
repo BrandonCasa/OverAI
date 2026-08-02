@@ -237,7 +237,9 @@ class WindowsCaptureBackend:
         self._mouse_events: deque[tuple[float, int, int]] = deque()
         self._held_vks: set[int] = set()
         self._held_mouse: set[str] = set()
+        self._stop_lock = threading.Lock()
         self._emergency = False
+        self._stop_reason: str | None = None
         self._input_thread: threading.Thread | None = None
         self._input_hwnd: int | None = None
         self._input_thread_id: int | None = None
@@ -247,7 +249,45 @@ class WindowsCaptureBackend:
         self._wndproc: object | None = None
         self._injected_held: set[str] = set()
         self._source_size: tuple[int, int] | None = None
+        self._capture_interruption: str | None = None
         self._last_preprocess_ms = 0.0
+
+    def _request_stop(self, reason: str) -> None:
+        with self._stop_lock:
+            if self._stop_reason is None:
+                self._stop_reason = reason
+            self._emergency = True
+
+    def _preprocess_frame_buffer(self, buffer: torch.Tensor) -> torch.Tensor | None:
+        preprocess_start = time.perf_counter()
+        height, width = buffer.shape[:2]
+        if height <= 0 or abs(width / height - 16 / 9) > 1e-3:
+            self._capture_interruption = "capture_aspect_mismatch"
+            return None
+        # Resolution changes are safe because every frame is normalized to the
+        # configured model size immediately below.
+        self._source_size = (height, width)
+        channels = buffer[..., (2, 0)].permute(2, 0, 1).contiguous()
+        if tuple(channels.shape[1:]) != (
+            self.cfg.image_height,
+            self.cfg.image_width,
+        ):
+            channels = (
+                F.interpolate(
+                    channels.unsqueeze(0).float(),
+                    size=(self.cfg.image_height, self.cfg.image_width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)[0]
+            )
+        else:
+            channels = channels.clone()
+        self._last_preprocess_ms = (time.perf_counter() - preprocess_start) * 1000.0
+        self._capture_interruption = None
+        return channels
 
     def _binding_held(self, binding: str) -> bool:
         normalized = binding.upper()
@@ -317,7 +357,7 @@ class WindowsCaptureBackend:
             else:
                 self._held_vks.add(virtual_key)
                 if virtual_key == _vk_code(self.profile.emergency_stop_key):
-                    self._emergency = True
+                    self._request_stop("emergency_stop_key")
 
     def _input_loop(self) -> None:
         instance = kernel32.GetModuleHandleW(None)
@@ -390,7 +430,7 @@ class WindowsCaptureBackend:
                 user32.DispatchMessageW(ctypes.byref(message))
         except BaseException as error:
             self._input_error = error
-            self._emergency = True
+            self._request_stop("raw_input_error")
             self._input_ready.set()
         finally:
             if hwnd:
@@ -408,7 +448,7 @@ class WindowsCaptureBackend:
         )
         self._input_thread.start()
         if not self._input_ready.wait(timeout=2.0):
-            self._emergency = True
+            self._request_stop("raw_input_initialization_timeout")
             self.stop()
             raise RuntimeError("Raw Input initialization timed out")
         if self._input_error is not None:
@@ -417,6 +457,10 @@ class WindowsCaptureBackend:
             raise RuntimeError("Raw Input initialization failed") from self._input_error
 
     def start(self) -> None:
+        with self._stop_lock:
+            self._emergency = False
+            self._stop_reason = None
+        self._capture_interruption = None
         try:
             import windows_capture  # pyright: ignore[reportMissingImports]
         except ImportError as error:
@@ -436,46 +480,22 @@ class WindowsCaptureBackend:
 
         @capture.event
         def on_frame_arrived(frame, _capture_control) -> None:
-            captured_at = time.perf_counter()
-            preprocess_start = time.perf_counter()
-            buffer = torch.from_numpy(frame.frame_buffer)
-            height, width = buffer.shape[:2]
-            if abs(width / height - 16 / 9) > 1e-3:
-                self._emergency = True
-                return
-            source_size = (height, width)
-            if self._source_size is None:
-                self._source_size = source_size
-            elif source_size != self._source_size:
-                self._emergency = True
-                return
-            channels = buffer[..., (2, 0)].permute(2, 0, 1).contiguous()
-            if tuple(channels.shape[1:]) != (
-                self.cfg.image_height,
-                self.cfg.image_width,
-            ):
-                channels = (
-                    F.interpolate(
-                        channels.unsqueeze(0).float(),
-                        size=(self.cfg.image_height, self.cfg.image_width),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    .round()
-                    .clamp(0, 255)
-                    .to(torch.uint8)[0]
-                )
-            else:
-                channels = channels.clone()
-            self._last_preprocess_ms = (
-                time.perf_counter() - preprocess_start
-            ) * 1000.0
-            with self._frame_lock:
-                self._latest_frame = (captured_at, channels)
+            try:
+                captured_at = time.perf_counter()
+                buffer = torch.from_numpy(frame.frame_buffer)
+                channels = self._preprocess_frame_buffer(buffer)
+                if channels is None:
+                    # Ignore a transient compositor resize. The recorder will reuse
+                    # its last valid frame for a bounded interval while WGC settles.
+                    return
+                with self._frame_lock:
+                    self._latest_frame = (captured_at, channels)
+            except BaseException:
+                self._request_stop("capture_preprocess_error")
 
         @capture.event
         def on_closed() -> None:
-            self._emergency = True
+            self._request_stop("capture_closed")
 
         try:
             self._capture_control = capture.start_free_threaded()
@@ -523,6 +543,13 @@ class WindowsCaptureBackend:
 
     def emergency_stop_requested(self) -> bool:
         return self._emergency
+
+    def emergency_stop_reason(self) -> str | None:
+        with self._stop_lock:
+            return self._stop_reason
+
+    def capture_interruption_reason(self) -> str | None:
+        return self._capture_interruption
 
     def capture_diagnostics(self) -> dict[str, float]:
         return {"preprocessing_ms": self._last_preprocess_ms}

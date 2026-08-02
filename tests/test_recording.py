@@ -88,6 +88,43 @@ class _FrameAvailableOnlyWhenWaitedForBackend(_SyntheticBackend):
         return super().latest_frame(timeout_ms)
 
 
+class _IntermittentFrameBackend(_SyntheticBackend):
+    def __init__(self, cfg: ModelConfig, missing_calls: set[int]) -> None:
+        super().__init__(cfg, pause_after_first=False)
+        self.missing_calls = missing_calls
+
+    def latest_frame(self, timeout_ms: int):
+        if self.capture_calls in self.missing_calls:
+            self.frame_timeouts.append(timeout_ms)
+            self.capture_calls += 1
+            return None
+        return super().latest_frame(timeout_ms)
+
+
+class _FrozenFrameBackend(_SyntheticBackend):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__(cfg, pause_after_first=False)
+
+    def latest_frame(self, timeout_ms: int):
+        if self.capture_calls > 0:
+            self.frame_timeouts.append(timeout_ms)
+            self.capture_calls += 1
+            return None
+        return super().latest_frame(timeout_ms)
+
+
+class _OneTimeSchedulerStallBackend(_SyntheticBackend):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__(cfg, pause_after_first=False)
+        self.stalled = False
+
+    def held_inputs(self) -> set[str]:
+        if self.held_calls == 3 and not self.stalled:
+            self.stalled = True
+            time.sleep(0.1)
+        return super().held_inputs()
+
+
 class RecordingTests(unittest.TestCase):
     def _profile_path(self, root: Path) -> Path:
         path = root / "profile.json"
@@ -234,6 +271,71 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(controls["fast_timestamps"].shape[0], 12)
             self.assertEqual(controls["frame_timestamps"].shape[0], 6)
             self.assertEqual(backend.frame_timeouts, [2000, 34, 34, 34, 34, 34])
+
+    def test_one_missing_wgc_callback_reuses_last_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _IntermittentFrameBackend(cfg, missing_calls={3})
+            episode = EpisodeRecorder(
+                backend, profile, cfg, root, "train", "wgc-single-miss"
+            ).record(duration_seconds=0.2)
+
+            controls = torch.load(episode / "controls.pt", weights_only=True)
+            metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(controls["fast_timestamps"].shape[0], 12)
+            self.assertEqual(controls["frame_timestamps"].shape[0], 6)
+            self.assertEqual(metadata["termination_reason"], "duration_complete")
+            self.assertEqual(metadata["reused_video_frames"], 1)
+
+    def test_persistent_wgc_freeze_closes_segment_with_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _FrozenFrameBackend(cfg)
+            episode = EpisodeRecorder(
+                backend, profile, cfg, root, "train", "wgc-freeze"
+            ).record(duration_seconds=None)
+
+            metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["termination_reason"], "capture_frame_timeout")
+            self.assertEqual(metadata["reused_video_frames"], 8)
+
+    def test_brief_scheduler_stall_resynchronizes_without_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _OneTimeSchedulerStallBackend(cfg)
+            episode = EpisodeRecorder(
+                backend, profile, cfg, root, "train", "scheduler-stall"
+            ).record(duration_seconds=0.2)
+
+            controls = torch.load(episode / "controls.pt", weights_only=True)
+            metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(controls["fast_timestamps"].shape[0], 12)
+            self.assertEqual(metadata["termination_reason"], "duration_complete")
+            self.assertGreater(float(controls["fast_timestamps"][-1]), 0.25)
 
     def test_transient_jpeg_stall_does_not_truncate_recording(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
