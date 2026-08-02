@@ -447,9 +447,7 @@ class EpisodeRecorder:
                         else:
                             captured_frame = captured
                             consecutive_reused_frames = 0
-                    captured_at, frame = captured_frame
-                    if fast_index == 0:
-                        captured_at = start
+                    _captured_at, frame = captured_frame
                     if tuple(frame.shape) != (
                         self.cfg.input_channels,
                         self.cfg.image_height,
@@ -458,7 +456,11 @@ class EpisodeRecorder:
                         raise ValueError("native capture returned an invalid RB frame")
                     last_frame = frame
                     enqueue_frame(_EncodedFrame(frame_index, frame.cpu()))
-                    frame_timestamps.append(captured_at - start)
+                    # Frames are observations consumed at this scheduled video
+                    # tick. A WGC callback may carry an older capture timestamp
+                    # after a reused-frame timeout; using the causal sample time
+                    # keeps the observation stream strictly ordered.
+                    frame_timestamps.append(now - start)
                     frame_index += 1
                 if fast_index % self.cfg.fast_ticks_per_slow == 0:
                     movement.append(self._movement(held, self.profile.movement))

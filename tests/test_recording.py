@@ -101,6 +101,32 @@ class _IntermittentFrameBackend(_SyntheticBackend):
         return super().latest_frame(timeout_ms)
 
 
+class _LateStaleFrameBackend(_SyntheticBackend):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__(cfg, pause_after_first=False)
+        self.stale_timestamp: float | None = None
+
+    def latest_frame(self, timeout_ms: int):
+        if self.capture_calls == 3:
+            self.frame_timeouts.append(timeout_ms)
+            self.capture_calls += 1
+            self.stale_timestamp = time.perf_counter() - 0.05
+            return None
+        if self.capture_calls == 4:
+            self.frame_timeouts.append(timeout_ms)
+            self.capture_calls += 1
+            return (
+                self.stale_timestamp,
+                torch.ones(
+                    2,
+                    self.cfg.image_height,
+                    self.cfg.image_width,
+                    dtype=torch.uint8,
+                ),
+            )
+        return super().latest_frame(timeout_ms)
+
+
 class _FrozenFrameBackend(_SyntheticBackend):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__(cfg, pause_after_first=False)
@@ -294,6 +320,27 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(controls["frame_timestamps"].shape[0], 6)
             self.assertEqual(metadata["termination_reason"], "duration_complete")
             self.assertEqual(metadata["reused_video_frames"], 1)
+
+    def test_late_stale_callback_cannot_reverse_frame_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = replace(
+                ModelConfig.tiny(),
+                num_buttons=6,
+                fast_hz=60,
+                video_hz=30,
+                slow_hz=10,
+            )
+            profile = ControlProfile.from_json(self._profile_path(root))
+            backend = _LateStaleFrameBackend(cfg)
+            episode = EpisodeRecorder(
+                backend, profile, cfg, root, "train", "wgc-late-stale"
+            ).record(duration_seconds=0.2)
+
+            controls = torch.load(episode / "controls.pt", weights_only=True)
+            frame_timestamps = controls["frame_timestamps"]
+            self.assertTrue(torch.all(frame_timestamps[1:] > frame_timestamps[:-1]))
+            self.assertEqual(frame_timestamps.shape[0], 6)
 
     def test_persistent_wgc_freeze_closes_segment_with_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
