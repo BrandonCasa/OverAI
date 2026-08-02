@@ -20,6 +20,7 @@ from torch.utils.data import Dataset
 from torchvision.io import ImageReadMode, decode_image
 
 from .config import ModelConfig
+from .telemetry import SIMILARITY_FORMULA, SIMILARITY_METRIC
 from .types import ExecutedActions, ObservationContext, TimingContext
 
 CONTROL_KEYS = (
@@ -232,6 +233,20 @@ def load_manifest(path: str | Path, cfg: ModelConfig) -> list[EpisodeRecord]:
     profile_hash = data.get("control_profile_sha256")
     if not isinstance(profile_hash, str) or not profile_hash:
         raise ValueError("dataset manifest must contain a control profile hash")
+    # Format-2 manifests created before HUD support could only contain zeros.
+    telemetry = data.get("telemetry", {"provider": "zero", "sha256": None})
+    if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
+        "zero",
+        "hud_telemetry",
+    }:
+        raise ValueError("dataset manifest must contain a telemetry configuration")
+    if telemetry.get("provider") == "hud_telemetry":
+        if not isinstance(telemetry.get("sha256"), str) or not telemetry["sha256"]:
+            raise ValueError("HUD telemetry manifest must contain its configuration hash")
+        if telemetry.get("similarity_metric") != SIMILARITY_METRIC or telemetry.get(
+            "similarity_formula"
+        ) != SIMILARITY_FORMULA:
+            raise ValueError("HUD telemetry manifest uses an unsupported color metric")
     normalization = data.get("axis_normalization")
     if not isinstance(normalization, dict):
         raise TypeError("dataset manifest axis_normalization must be an object")

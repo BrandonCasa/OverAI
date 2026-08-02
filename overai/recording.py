@@ -20,6 +20,12 @@ import torch
 from torchvision.io import write_jpeg
 
 from .config import ModelConfig
+from .telemetry import (
+    HudTelemetryConfig,
+    TelemetryWorker,
+    coerce_captured_frame,
+    create_telemetry_worker,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +43,7 @@ class ControlProfile:
     emergency_stop_key: str
     invert_axes: tuple[bool, bool] = (False, False)
     telemetry_provider: str = "zero"
+    hud_telemetry: HudTelemetryConfig | None = None
 
     @classmethod
     def from_json(cls, path: str | Path) -> ControlProfile:
@@ -76,8 +83,16 @@ class ControlProfile:
         ):
             raise ValueError("invert_axes must contain two booleans")
         telemetry = payload.get("telemetry_provider", "zero")
-        if telemetry != "zero":
-            raise ValueError("only the zero telemetry provider is currently implemented")
+        if telemetry not in {"zero", "hud_telemetry"}:
+            raise ValueError("telemetry_provider must be zero or hud_telemetry")
+        hud_payload = payload.get("hud_telemetry")
+        hud_telemetry = (
+            HudTelemetryConfig.from_mapping(hud_payload)
+            if telemetry == "hud_telemetry"
+            else None
+        )
+        if telemetry == "zero" and hud_payload is not None:
+            raise ValueError("hud_telemetry configuration requires its provider")
         pause = payload.get("pause_key")
         emergency = payload.get("emergency_stop_key")
         if not isinstance(pause, str) or not pause:
@@ -92,20 +107,17 @@ class ControlProfile:
             emergency_stop_key=emergency,
             invert_axes=(invert_axes[0], invert_axes[1]),
             telemetry_provider=telemetry,
+            hud_telemetry=hud_telemetry,
         )
 
     def sha256(self) -> str:
         canonical = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-
-class TelemetryProvider(Protocol):
-    def sample(self) -> tuple[float, float, float, float]: ...
-
-
-class ZeroTelemetryProvider:
-    def sample(self) -> tuple[float, float, float, float]:
-        return 0.0, 0.0, 0.0, 0.0
+    def telemetry_manifest(self) -> dict[str, Any]:
+        if self.hud_telemetry is None:
+            return {"provider": "zero", "sha256": None}
+        return self.hud_telemetry.manifest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +197,7 @@ class NativeRecorderBackend(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def latest_frame(self, timeout_ms: int) -> tuple[float, torch.Tensor] | None: ...
+    def latest_frame(self, timeout_ms: int) -> Any: ...
     def drain_mouse_deltas(self, start: float, end: float) -> tuple[int, int]: ...
     def held_inputs(self) -> set[str]: ...
     def target_active(self) -> bool: ...
@@ -219,6 +231,7 @@ class EpisodeRecorder:
         output_dir: Path,
         split: str,
         episode_id: str,
+        telemetry_worker: TelemetryWorker | None = None,
     ) -> None:
         if split not in {"train", "validation"}:
             raise ValueError("split must be train or validation")
@@ -230,6 +243,7 @@ class EpisodeRecorder:
         self.output_dir = output_dir
         self.split = split
         self.episode_id = episode_id
+        self.telemetry_worker = telemetry_worker
 
     @staticmethod
     def _movement(held: set[str], bindings: dict[str, str]) -> tuple[int, int]:
@@ -274,7 +288,9 @@ class EpisodeRecorder:
 
         worker = threading.Thread(target=encode_worker, name="overai-jpeg", daemon=True)
         worker.start()
-        telemetry = ZeroTelemetryProvider()
+        telemetry = self.telemetry_worker or create_telemetry_worker(
+            self.profile.telemetry_provider, self.profile.hud_telemetry
+        )
         fast_deltas: list[tuple[int, int]] = []
         fast_durations: list[float] = []
         fast_timestamps: list[float] = []
@@ -283,7 +299,15 @@ class EpisodeRecorder:
         movement: list[tuple[int, int]] = []
         buttons: list[list[int]] = []
         contexts: list[tuple[float, float, float, float]] = []
-        self.backend.start()
+        telemetry.start()
+        try:
+            self.backend.start()
+        except BaseException:
+            telemetry.stop(drain=False)
+            encode_queue.put(None)
+            worker.join()
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+            raise
         start = time.perf_counter()
         previous_fast = start
         frame_index = 0
@@ -311,6 +335,13 @@ class EpisodeRecorder:
                     break
                 if now - deadline > 2.0 / self.cfg.fast_hz:
                     break
+                failure_duration = (
+                    None
+                    if self.profile.hud_telemetry is None
+                    else self.profile.hud_telemetry.failure_termination_seconds
+                )
+                if telemetry.should_terminate(now, failure_duration):
+                    break
                 fast_timestamps.append(now - start)
                 fast_durations.append(max(now - previous_fast, 1.0 / self.cfg.fast_hz))
                 fast_deltas.append(self.backend.drain_mouse_deltas(previous_fast, now))
@@ -321,20 +352,25 @@ class EpisodeRecorder:
                         if frame_index:
                             break
                         raise RuntimeError("no fresh Windows Graphics Capture frame")
-                    captured_at, frame = captured
+                    captured_frame = coerce_captured_frame(captured)
+                    captured_at = captured_frame.timestamp
+                    frame = captured_frame.model_channels
                     if tuple(frame.shape) != (
                         self.cfg.input_channels,
                         self.cfg.image_height,
                         self.cfg.image_width,
                     ) or frame.dtype != torch.uint8:
                         raise ValueError("native capture returned an invalid RB frame")
+                    telemetry.submit(captured_frame)
                     encode_queue.put(_EncodedFrame(frame_index, frame.cpu()))
                     frame_timestamps.append(captured_at - start)
                     frame_index += 1
                 if fast_index % self.cfg.fast_ticks_per_slow == 0:
                     movement.append(self._movement(held, self.profile.movement))
                     buttons.append([int(binding in held) for binding in self.profile.buttons])
-                    contexts.append(telemetry.sample())
+                    snapshot = telemetry.sample(now)
+                    contexts.append(snapshot.values())
+                    telemetry.acknowledge(snapshot)
                     slow_timestamps.append(now - start)
                     slow_index += 1
                 fast_index += 1
@@ -343,9 +379,12 @@ class EpisodeRecorder:
         except BaseException as error:
             failure = error
         finally:
-            self.backend.stop()
-            encode_queue.put(None)
-            worker.join()
+            try:
+                self.backend.stop()
+            finally:
+                telemetry.stop()
+                encode_queue.put(None)
+                worker.join()
         if failure is not None:
             shutil.rmtree(temporary_dir, ignore_errors=True)
             raise failure
@@ -375,6 +414,10 @@ class EpisodeRecorder:
             "id": self.episode_id,
             "split": self.split,
             "profile_sha256": self.profile.sha256(),
+            "telemetry": {
+                **self.profile.telemetry_manifest(),
+                "diagnostics": telemetry.diagnostics(),
+            },
             "finalized": False,
         }
         (temporary_dir / "episode.json").write_text(
@@ -488,6 +531,22 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
     }
     if len(profile_hashes) != 1:
         raise ValueError("all train and validation episodes must use one control profile")
+    telemetry_manifests = {
+        json.dumps(
+            {
+                key: value
+                for key, value in json.loads(
+                    (episode / "episode.json").read_text(encoding="utf-8")
+                ).get("telemetry", {"provider": "zero", "sha256": None}).items()
+                if key != "diagnostics"
+            },
+            sort_keys=True,
+        )
+        for episode in (*train_episodes, *validation_episodes)
+    }
+    if len(telemetry_manifests) != 1:
+        raise ValueError("all episodes must use one telemetry configuration")
+    telemetry_manifest = json.loads(next(iter(telemetry_manifests)))
     for root, split, episodes in (
         (train_path, "train", train_episodes),
         (validation_path, "validation", validation_episodes),
@@ -518,6 +577,7 @@ def finalize_dataset(train_path: Path, validation_path: Path) -> AxisNormalizati
             "channels": ["R", "B"],
             "axis_normalization": normalization.to_manifest(),
             "control_profile_sha256": next(iter(profile_hashes)),
+            "telemetry": telemetry_manifest,
             "episodes": entries,
         }
         temporary_manifest = root / f"{split}.json.tmp"

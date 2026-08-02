@@ -232,6 +232,7 @@ def save_checkpoint(
     training_cfg: TrainingConfig,
     axis_normalization: dict[str, Any],
     control_profile_sha256: str,
+    telemetry: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -242,6 +243,7 @@ def save_checkpoint(
             "training_config": asdict(training_cfg),
             "axis_normalization": axis_normalization,
             "control_profile_sha256": control_profile_sha256,
+            "telemetry": telemetry,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
@@ -316,6 +318,15 @@ def run_training(
     control_profile_sha256 = manifest_payload.get("control_profile_sha256")
     if not isinstance(control_profile_sha256, str) or not control_profile_sha256:
         raise TypeError("training manifest is missing control_profile_sha256")
+    # Pre-HUD format-2 manifests unambiguously used the zero provider.
+    telemetry = manifest_payload.get(
+        "telemetry", {"provider": "zero", "sha256": None}
+    )
+    if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
+        "zero",
+        "hud_telemetry",
+    }:
+        raise TypeError("training manifest is missing telemetry configuration")
     generator = torch.Generator().manual_seed(training_cfg.seed)
     loader = DataLoader(
         dataset,
@@ -383,6 +394,7 @@ def run_training(
                     training_cfg,
                     axis_normalization,
                     control_profile_sha256,
+                    telemetry,
                 )
             if max_batches is not None and batch_index + 1 >= max_batches:
                 break
@@ -401,6 +413,7 @@ def run_training(
             training_cfg,
             axis_normalization,
             control_profile_sha256,
+            telemetry,
         )
 
 

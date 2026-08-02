@@ -123,9 +123,22 @@ uv run overai-train `
 
 ## Windows recording and dataset finalization
 
-Copy `configs/windows_control_profile.example.json`, then set the required process,
-title regex, movement keys, exactly six buttons, pause/emergency keys, and axis
-inversion. The shipped telemetry provider explicitly records zeros.
+Copy `configs/windows_control_profile.example.json` for explicit zero telemetry, or
+`configs/windows_control_profile.hud.example.json` for HUD analysis. Set the
+required process, title regex, movement keys, exactly six buttons,
+pause/emergency keys, and axis inversion. The HUD example's coordinates and
+colors are deliberately non-production placeholders: replace every bounding box,
+sample point, color, and maximum-health value from 1920x1080 reference captures.
+
+HUD analysis runs on each fresh 30 Hz BGRA surface before green is discarded for
+the model. Health and charge use configurable bitmap-glyph OCR with bounded stale
+retention. Four-point hitmarkers and seven-point kill markers use normalized RGB
+Euclidean similarity, debounce persistent HUD state, and remain latched until a
+5 Hz sample is written. The same bounded latest-frame worker supplies recording,
+benchmarking, and RTX inference; OCR never runs on the 60 Hz inference thread.
+The profile hash includes all OCR, coordinate, color, similarity, debounce, stale,
+and failure-policy settings, and finalized dataset manifests retain the telemetry
+configuration hash and similarity formula.
 
 ```powershell
 .venv-rtx\Scripts\overai-record.exe --profile configs\my-profile.json --split train --episode-id run-001 --output D:\overai\train

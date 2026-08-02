@@ -124,6 +124,9 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue((episode / "frames_r" / "000000.jpg").is_file())
             self.assertFalse(episode.with_name("paused-1.recording").exists())
             self.assertTrue(backend.stopped)
+            metadata = json.loads((episode / "episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["telemetry"]["provider"], "zero")
+            self.assertEqual(metadata["telemetry"]["diagnostics"]["provider"], "zero")
 
     def test_capture_failure_removes_temporary_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -192,6 +195,7 @@ class RecordingTests(unittest.TestCase):
                 manifest["axis_normalization"]["scale_counts_per_second"],
                 list(normalization.scale_counts_per_second),
             )
+            self.assertEqual(manifest["telemetry"]["provider"], "zero")
 
 
 if __name__ == "__main__":

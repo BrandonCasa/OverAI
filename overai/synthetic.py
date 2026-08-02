@@ -95,6 +95,7 @@ def create_synthetic_dataset(
         "split": "train",
         "channels": ["R", "B"],
         "control_profile_sha256": "synthetic-zero-profile",
+        "telemetry": {"provider": "zero", "sha256": None},
         "axis_normalization": {
             "method": "synthetic",
             "percentile": 99.5,
