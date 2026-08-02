@@ -210,7 +210,10 @@ uv run overai-train `
 ```
 
 Optional `--compile-vision` can improve steady-state throughput, but first-run
-compilation is slow. Resume with the helper so all memory-related settings remain
+compilation is slow. The training compiler keeps TorchInductor enabled while
+disabling CUDA Graph capture: each TBPTT chunk retains several vision outputs until
+one shared backward pass, so those outputs cannot safely be recycled as separate
+CUDA Graph iterations. Resume with the helper so all memory-related settings remain
 unchanged:
 
 ```powershell

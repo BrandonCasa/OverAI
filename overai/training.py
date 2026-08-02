@@ -178,6 +178,23 @@ def parameter_count(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+def _compile_vision_for_training(
+    model: HierarchicalImitationController,
+) -> None:
+    compile_vision = getattr(model.vision, "compile", None)
+    if not callable(compile_vision):
+        raise TypeError("this PyTorch build does not provide nn.Module.compile")
+
+    # A TBPTT chunk invokes vision several times before its shared backward pass.
+    # Those compiled outputs must remain live for autograd, so they cannot safely
+    # be treated as separate CUDA Graph iterations. Keep Inductor compilation,
+    # but disable CUDA Graph capture for this training-specific call pattern.
+    compile_vision(
+        fullgraph=False,
+        options={"triton.cudagraphs": False},
+    )
+
+
 def _autocast_context(device: torch.device, enabled: bool):
     if enabled:
         return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -399,9 +416,7 @@ def evaluate_model(
                                 encoded.cpu(), minlength=9
                             ).reshape(3, 3)
 
-                        button_prediction = (
-                            slow_prediction.immediate_button_logits >= 0
-                        )
+                        button_prediction = slow_prediction.immediate_button_logits >= 0
                         button_target = slow_targets.buttons[:, 0].bool()
                         button_true_positives += int(
                             (button_prediction & button_target).sum()
@@ -435,8 +450,12 @@ def evaluate_model(
     for axis in range(2):
         for class_index in range(3):
             true_positive = int(movement_confusion[axis, class_index, class_index])
-            false_positive = int(movement_confusion[axis, :, class_index].sum()) - true_positive
-            false_negative = int(movement_confusion[axis, class_index, :].sum()) - true_positive
+            false_positive = (
+                int(movement_confusion[axis, :, class_index].sum()) - true_positive
+            )
+            false_negative = (
+                int(movement_confusion[axis, class_index, :].sum()) - true_positive
+            )
             denominator = 2 * true_positive + false_positive + false_negative
             if denominator:
                 movement_f1_values.append(2 * true_positive / denominator)
@@ -447,8 +466,7 @@ def evaluate_model(
     metrics = {
         "loss": total_loss / total_prediction_terms,
         "movement_accuracy": movement_correct / max(movement_total, 1),
-        "movement_macro_f1": sum(movement_f1_values)
-        / max(len(movement_f1_values), 1),
+        "movement_macro_f1": sum(movement_f1_values) / max(len(movement_f1_values), 1),
         "button_accuracy": button_correct / max(button_total, 1),
         "button_f1": (
             2 * button_true_positives / button_f1_denominator
@@ -460,10 +478,7 @@ def evaluate_model(
         "windows": float(windows),
     }
     metrics.update(
-        {
-            name: value / metric_counts[name]
-            for name, value in metric_totals.items()
-        }
+        {name: value / metric_counts[name] for name, value in metric_totals.items()}
     )
     if not all(math.isfinite(value) for value in metrics.values()):
         raise FloatingPointError("validation produced non-finite metrics")
@@ -557,9 +572,7 @@ def load_checkpoint(
     epoch_complete = bool(checkpoint_data.get("epoch_complete", False))
     resume_epoch = checkpoint_epoch + int(epoch_complete)
     batches_completed = (
-        0
-        if epoch_complete
-        else checkpoint_data.get("batches_completed_in_epoch")
+        0 if epoch_complete else checkpoint_data.get("batches_completed_in_epoch")
     )
     if batches_completed is not None:
         batches_completed = int(batches_completed)
@@ -664,9 +677,7 @@ def run_training(
     if not isinstance(control_profile_sha256, str) or not control_profile_sha256:
         raise TypeError("training manifest is missing control_profile_sha256")
     # Pre-HUD format-2 manifests unambiguously used the zero provider.
-    telemetry = manifest_payload.get(
-        "telemetry", {"provider": "zero", "sha256": None}
-    )
+    telemetry = manifest_payload.get("telemetry", {"provider": "zero", "sha256": None})
     if not isinstance(telemetry, dict) or telemetry.get("provider") not in {
         "zero",
         "hud_telemetry",
@@ -716,9 +727,7 @@ def run_training(
         if generator_state is not None:
             generator.set_state(generator_state)
     if training_cfg.compile_vision:
-        if not hasattr(model.vision, "compile"):
-            raise RuntimeError("this PyTorch build does not provide nn.Module.compile")
-        model.vision.compile(fullgraph=False, mode="reduce-overhead")
+        _compile_vision_for_training(model)
 
     tbptt_ticks = round(training_cfg.tbptt_seconds * model_cfg.fast_hz)
     if tbptt_ticks <= 0:
@@ -799,10 +808,7 @@ def run_training(
                     ),
                     validation_metrics=last_validation_metrics,
                 )
-            if (
-                max_batches is not None
-                and newly_processed_batches >= max_batches
-            ):
+            if max_batches is not None and newly_processed_batches >= max_batches:
                 break
 
         mean_epoch_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -826,9 +832,7 @@ def run_training(
                 batches_completed_in_epoch=processed_batches,
                 data_loader_generator_state=epoch_generator_state,
                 best_validation_loss=(
-                    None
-                    if math.isinf(best_validation_loss)
-                    else best_validation_loss
+                    None if math.isinf(best_validation_loss) else best_validation_loss
                 ),
                 validation_metrics=last_validation_metrics,
             )

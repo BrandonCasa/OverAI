@@ -1,0 +1,4 @@
+.\scripts\train-overwatch-rtx4080.ps1 `
+-Train `
+-CompileVision `
+-Epochs 20

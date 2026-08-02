@@ -14,6 +14,7 @@ from overai.synthetic import create_synthetic_dataset
 from overai.training import (
     TrainingConfig,
     _build_training_datasets,
+    _compile_vision_for_training,
     _legacy_batches_completed_in_epoch,
     evaluate_model,
     load_checkpoint,
@@ -23,6 +24,29 @@ from overai.training import (
 
 
 class TrainingPipelineTests(unittest.TestCase):
+    def test_training_vision_compile_disables_cuda_graphs(self) -> None:
+        class StubVision:
+            def __init__(self) -> None:
+                self.compile_kwargs: dict[str, object] | None = None
+
+            def compile(self, **kwargs: object) -> None:
+                self.compile_kwargs = kwargs
+
+        class StubModel:
+            def __init__(self) -> None:
+                self.vision = StubVision()
+
+        model = StubModel()
+        _compile_vision_for_training(model)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            model.vision.compile_kwargs,
+            {
+                "fullgraph": False,
+                "options": {"triton.cudagraphs": False},
+            },
+        )
+
     def test_synthetic_dataset_and_cpu_train_step(self) -> None:
         cfg = ModelConfig.tiny()
         with tempfile.TemporaryDirectory() as temporary:
