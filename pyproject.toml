@@ -1,0 +1,24 @@
+[project]
+name = "overai"
+version = "0.1.0"
+description = "Minimal NVIDIA GPU PyTorch environment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate",
+    "einops",
+    "nvidia-ml-py",
+    "safetensors",
+    "torch",
+    "torchvision",
+    "transformers",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
