@@ -217,6 +217,8 @@ class RecordingTests(unittest.TestCase):
         second = inverse.convert(torch.tensor([0.5, 0.5]), 0.01)
         self.assertGreaterEqual(first[0] + second[0], 0)
         self.assertLessEqual(first[1] + second[1], 0)
+        with self.assertRaisesRegex(ValueError, "axes must be finite"):
+            inverse.convert(torch.tensor([float("nan"), 0.0]), 0.01)
 
     def test_recorder_closes_pause_segment_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

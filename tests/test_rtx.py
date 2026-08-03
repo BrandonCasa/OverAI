@@ -12,6 +12,11 @@ from overai.config import ModelConfig
 from overai.rtx import (
     METADATA_INPUT_NAMES,
     Rtx4080Controller,
+    _benchmark_acceptance_failures,
+    _nonfinite_control_outputs,
+    _poll_video_frame,
+    _realtime_capture_timeout_ms,
+    _tensorrt_logger,
     _update_timing,
     validate_engine_builder,
 )
@@ -90,7 +95,102 @@ def _metadata() -> dict[str, torch.Tensor]:
     return {name: torch.zeros(1) for name in METADATA_INPUT_NAMES}
 
 
+class _CaptureBackend:
+    def __init__(self, frames: list[tuple[float, torch.Tensor] | None]) -> None:
+        self.frames = frames
+        self.timeouts: list[int] = []
+
+    def latest_frame(self, timeout_ms: int) -> tuple[float, torch.Tensor] | None:
+        self.timeouts.append(timeout_ms)
+        return self.frames.pop(0)
+
+
 class RtxSchedulingTests(unittest.TestCase):
+    def test_tensorrt_logger_is_reused_for_the_loaded_sdk(self) -> None:
+        class FakeLogger:
+            WARNING = 1
+            instances = 0
+
+            def __init__(self, _severity: int) -> None:
+                FakeLogger.instances += 1
+
+        class FakeTensorRt:
+            Logger = FakeLogger
+
+        _tensorrt_logger.cache_clear()
+        first = _tensorrt_logger(FakeTensorRt)
+        second = _tensorrt_logger(FakeTensorRt)
+        self.assertIs(first, second)
+        self.assertEqual(FakeLogger.instances, 1)
+
+    def test_realtime_capture_poll_absorbs_jitter_and_bounds_reuse(self) -> None:
+        cfg = ModelConfig.tiny()
+        self.assertEqual(_realtime_capture_timeout_ms(cfg), 62)
+        previous = (1.0, torch.zeros(1))
+        fresh = (2.0, torch.ones(1))
+        backend = _CaptureBackend([None, fresh, None, None])
+
+        repeated, is_fresh, reuses = _poll_video_frame(
+            backend,
+            previous,
+            timeout_ms=3,
+            consecutive_reuses=0,
+            maximum_reuses=1,
+        )
+        self.assertIs(repeated, previous)
+        self.assertFalse(is_fresh)
+        self.assertEqual(reuses, 1)
+
+        captured, is_fresh, reuses = _poll_video_frame(
+            backend,
+            repeated,
+            timeout_ms=3,
+            consecutive_reuses=reuses,
+            maximum_reuses=1,
+        )
+        self.assertIs(captured, fresh)
+        self.assertTrue(is_fresh)
+        self.assertEqual(reuses, 0)
+
+        repeated, _, reuses = _poll_video_frame(
+            backend,
+            captured,
+            timeout_ms=3,
+            consecutive_reuses=reuses,
+            maximum_reuses=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "2 scheduled video ticks"):
+            _poll_video_frame(
+                backend,
+                repeated,
+                timeout_ms=3,
+                consecutive_reuses=reuses,
+                maximum_reuses=1,
+            )
+        self.assertEqual(backend.timeouts, [3, 3, 3, 3])
+
+    def test_benchmark_acceptance_names_the_failed_gate(self) -> None:
+        report = {
+            "latency_ms": {"p99": 8.0, "maximum": 10.0},
+            "deadline_misses": 0,
+            "capture_stalls": 2,
+            "peak_inference_vram_bytes": 64 * 1024**2,
+        }
+        self.assertEqual(
+            _benchmark_acceptance_failures(report, ModelConfig.tiny()),
+            ["capture stalls 2 > 0"],
+        )
+
+    def test_nonfinite_control_outputs_are_named_before_application(self) -> None:
+        self.assertEqual(
+            _nonfinite_control_outputs(
+                torch.tensor([[float("nan"), 0.0]]),
+                torch.zeros(1, 2, 3),
+                torch.full((1, 6), float("inf")),
+            ),
+            ["axes", "buttons"],
+        )
+
     def test_engine_builder_validation_fails_before_export_without_sdk(self) -> None:
         with (
             patch("overai.rtx.sys.version_info", (3, 13)),

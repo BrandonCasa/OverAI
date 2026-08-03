@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from overai.blocks import FourierTimeEmbedding
 from overai.config import ModelConfig
 from overai.losses import fast_axis_loss, slow_control_loss
 from overai.model import (
@@ -35,6 +36,18 @@ class ControllerTests(unittest.TestCase):
             since_slow_update=torch.zeros(1, 1),
             fast_delta_time=torch.full((1, 1), 1 / self.cfg.fast_hz),
         )
+
+    def test_fp16_fourier_time_embedding_remains_finite_after_two_seconds(
+        self,
+    ) -> None:
+        embedding = FourierTimeEmbedding(4, 32, frequencies=16).half().eval()
+        timestamps = torch.tensor(
+            [[2.0, 60.0, 600.0, 3600.0]], dtype=torch.float16
+        )
+        with torch.inference_mode():
+            output = embedding(timestamps)
+        self.assertEqual(output.dtype, torch.float16)
+        self.assertTrue(torch.isfinite(output).all())
 
     def test_streaming_shapes_and_gradients(self) -> None:
         state = self.model.initial_state(1, "cpu")

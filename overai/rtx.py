@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import functools
 import hashlib
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -37,13 +39,22 @@ from .types import (
 
 RTX_GPU_NAME = "NVIDIA GeForce RTX 4080"
 RTX_COMPUTE_CAPABILITY = (8, 9)
-ARTIFACT_VERSION = 3
+ARTIFACT_VERSION = 4
+_CAPTURE_REUSE_BUDGET_SECONDS = 0.25
+_CAPTURE_WAIT_BUDGET_FRACTION = 0.25
 
 
 def _tensorrt_rtx() -> Any:
     """Load dynamic SDK bindings without relying on their incomplete stubs."""
 
     return importlib.import_module("tensorrt_rtx")
+
+
+@functools.cache
+def _tensorrt_logger(trt: Any) -> Any:
+    """Return the one logger TensorRT permits for each loaded SDK module."""
+
+    return trt.Logger(trt.Logger.WARNING)
 
 
 def _torch_dtype(trt_dtype: Any) -> torch.dtype:
@@ -70,7 +81,7 @@ class TensorRtxEngine:
     def __init__(self, engine_path: Path, device: torch.device) -> None:
         trt = _tensorrt_rtx()
 
-        logger = trt.Logger(trt.Logger.WARNING)
+        logger = _tensorrt_logger(trt)
         runtime = trt.Runtime(logger)
         engine = runtime.deserialize_cuda_engine(engine_path.read_bytes())
         if engine is None:
@@ -736,7 +747,7 @@ def _build_engine_python(onnx_path: Path, engine_path: Path) -> str:
         raise RuntimeError(
             "TensorRT-RTX SDK CLI or Python package is required to build engines"
         ) from error
-    logger = trt.Logger(trt.Logger.WARNING)
+    logger = _tensorrt_logger(trt)
     builder = trt.Builder(logger)
     network = builder.create_network(
         1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
@@ -902,6 +913,79 @@ def _normalization_from_artifact(artifact: dict[str, Any]) -> AxisNormalization:
     )
 
 
+def _realtime_capture_timeout_ms(cfg: ModelConfig) -> int:
+    """Absorb normal callback jitter without consuming the 60 Hz tick budget."""
+
+    fast_tick_ms = 1000.0 / cfg.fast_hz
+    return max(1, math.floor(fast_tick_ms * _CAPTURE_WAIT_BUDGET_FRACTION))
+
+
+def _poll_video_frame(
+    backend: Any,
+    previous: tuple[float, torch.Tensor],
+    *,
+    timeout_ms: int,
+    consecutive_reuses: int,
+    maximum_reuses: int,
+) -> tuple[tuple[float, torch.Tensor], bool, int]:
+    """Poll a fresh frame, tolerating only a bounded WGC interruption."""
+
+    latest = backend.latest_frame(timeout_ms=timeout_ms)
+    if latest is not None:
+        return latest, True, 0
+    consecutive_reuses += 1
+    if consecutive_reuses > maximum_reuses:
+        reason_getter = getattr(backend, "capture_interruption_reason", None)
+        reason = reason_getter() if callable(reason_getter) else None
+        detail = f": {reason}" if reason else ""
+        raise RuntimeError(
+            f"Windows Graphics Capture produced no fresh frame for "
+            f"{consecutive_reuses} scheduled video ticks{detail}"
+        )
+    return previous, False, consecutive_reuses
+
+
+def _benchmark_acceptance_failures(
+    report: dict[str, Any], cfg: ModelConfig
+) -> list[str]:
+    failures: list[str] = []
+    latency = report["latency_ms"]
+    fast_tick_ms = 1000.0 / cfg.fast_hz
+    if latency["p99"] > 13.33:
+        failures.append(f"latency p99 {latency['p99']:.3f} ms > 13.330 ms")
+    if latency["maximum"] >= fast_tick_ms:
+        failures.append(
+            f"maximum latency {latency['maximum']:.3f} ms >= "
+            f"{fast_tick_ms:.3f} ms"
+        )
+    if report["deadline_misses"]:
+        failures.append(f"deadline misses {report['deadline_misses']} > 0")
+    if report["capture_stalls"]:
+        failures.append(f"capture stalls {report['capture_stalls']} > 0")
+    if report["peak_inference_vram_bytes"] >= 4 * 1024**3:
+        failures.append(
+            f"peak inference VRAM {report['peak_inference_vram_bytes']} bytes "
+            f">= {4 * 1024**3} bytes"
+        )
+    return failures
+
+
+def _nonfinite_control_outputs(
+    axes: torch.Tensor,
+    movement: torch.Tensor | None,
+    buttons: torch.Tensor | None,
+) -> list[str]:
+    return [
+        name
+        for name, value in (
+            ("axes", axes),
+            ("movement", movement),
+            ("buttons", buttons),
+        )
+        if value is not None and not bool(torch.isfinite(value).all())
+    ]
+
+
 def _gpu_telemetry() -> dict[str, str] | None:
     try:
         completed = subprocess.run(
@@ -991,6 +1075,10 @@ def benchmark_main() -> None:
     torch.cuda.reset_peak_memory_stats(device)
     gpu_telemetry_start = _gpu_telemetry()
     timer = _HighResolutionTimer()
+    capture_timeout_ms = _realtime_capture_timeout_ms(cfg)
+    maximum_reuses = max(
+        1, math.ceil(cfg.video_hz * _CAPTURE_REUSE_BUDGET_SECONDS)
+    )
     try:
         backend.start()
     except BaseException:
@@ -1010,6 +1098,8 @@ def benchmark_main() -> None:
         warmup_ticks = int(args.warmup * cfg.fast_hz)
         last_video = start
         last_slow = start
+        previous_frame = initial_frame
+        consecutive_reuses = 0
         for tick in range(total_ticks):
             deadline = start + tick / cfg.fast_hz
             timer.wait_until(deadline)
@@ -1017,18 +1107,31 @@ def benchmark_main() -> None:
                 raise RuntimeError("benchmark stopped because focus or target was lost")
             tick_start = time.perf_counter()
             video_frame: torch.Tensor | None = None
-            latest: Any = None
+            fresh_frame = False
             if tick % cfg.fast_ticks_per_video == 0:
-                latest = initial_frame if tick == 0 else backend.latest_frame(timeout_ms=0)
-                if latest is None:
-                    capture_stalls += 1
+                if tick == 0:
+                    latest = initial_frame
+                    fresh_frame = True
                 else:
+                    latest, fresh_frame, consecutive_reuses = _poll_video_frame(
+                        backend,
+                        previous_frame,
+                        timeout_ms=capture_timeout_ms,
+                        consecutive_reuses=consecutive_reuses,
+                        maximum_reuses=maximum_reuses,
+                    )
+                previous_frame = latest
+                if fresh_frame:
                     captured_at, frame = latest
                     frame_host[0].copy_(frame)
                     transfer_start.record()
                     frame_gpu.copy_(frame_host, non_blocking=True)
                     transfer_end.record()
-                    fresh_frames += 1
+                if tick >= warmup_ticks:
+                    if fresh_frame:
+                        fresh_frames += 1
+                    else:
+                        capture_stalls += 1
                 video_frame = frame_gpu
                 last_video = tick_start
             _update_timing(
@@ -1048,10 +1151,16 @@ def benchmark_main() -> None:
             engine_end.record()
             torch.cuda.synchronize(device)
             elapsed = (time.perf_counter() - tick_start) * 1000.0
+            nonfinite = _nonfinite_control_outputs(axes, movement, buttons)
+            if nonfinite:
+                raise FloatingPointError(
+                    f"TensorRT produced non-finite {', '.join(nonfinite)} "
+                    f"at tick {tick}"
+                )
             if tick >= warmup_ticks:
                 latencies.append(elapsed)
                 engine_times.append(engine_start.elapsed_time(engine_end))
-                if video_frame is not None and latest is not None:
+                if video_frame is not None and fresh_frame:
                     transfer_times.append(transfer_start.elapsed_time(transfer_end))
                     capture_ages.append(max(0.0, (tick_start - captured_at) * 1000.0))
                     diagnostics = getattr(backend, "capture_diagnostics", dict)()
@@ -1101,14 +1210,11 @@ def benchmark_main() -> None:
         "gpu_telemetry_end": _gpu_telemetry(),
     }
     print(json.dumps(report, indent=2))
-    if (
-        report["latency_ms"]["p99"] > 13.33
-        or report["latency_ms"]["maximum"] >= 1000.0 / cfg.fast_hz
-        or deadline_misses
-        or capture_stalls
-        or report["peak_inference_vram_bytes"] >= 4 * 1024**3
-    ):
-        raise RuntimeError("RTX 4080 benchmark failed an acceptance gate")
+    failures = _benchmark_acceptance_failures(report, cfg)
+    if failures:
+        raise RuntimeError(
+            "RTX 4080 benchmark failed acceptance: " + "; ".join(failures)
+        )
 
 
 def run_main() -> None:
@@ -1143,6 +1249,10 @@ def run_main() -> None:
     frame_gpu = torch.empty_like(frame_host, device=device)
     axes_host = torch.empty((1, 2), dtype=torch.float16, pin_memory=True)
     timer = _HighResolutionTimer()
+    capture_timeout_ms = _realtime_capture_timeout_ms(cfg)
+    maximum_reuses = max(
+        1, math.ceil(cfg.video_hz * _CAPTURE_REUSE_BUDGET_SECONDS)
+    )
     try:
         backend.start()
     except BaseException:
@@ -1160,6 +1270,8 @@ def run_main() -> None:
         frame_host[0].copy_(first_frame)
         frame_gpu.copy_(frame_host, non_blocking=True)
         torch.cuda.synchronize(device)
+        previous_frame = initial_frame
+        consecutive_reuses = 0
         tick = 0
         while True:
             timer.wait_until(start + tick / cfg.fast_hz)
@@ -1173,16 +1285,22 @@ def run_main() -> None:
                 break
             video_frame: torch.Tensor | None = None
             if tick % cfg.fast_ticks_per_video == 0:
-                latest = (
-                    initial_frame
-                    if tick == 0
-                    else backend.latest_frame(timeout_ms=0)
-                )
-                if latest is None:
-                    break
-                _, frame = latest
-                frame_host[0].copy_(frame)
-                frame_gpu.copy_(frame_host, non_blocking=True)
+                if tick == 0:
+                    latest = initial_frame
+                    fresh_frame = True
+                else:
+                    latest, fresh_frame, consecutive_reuses = _poll_video_frame(
+                        backend,
+                        previous_frame,
+                        timeout_ms=capture_timeout_ms,
+                        consecutive_reuses=consecutive_reuses,
+                        maximum_reuses=maximum_reuses,
+                    )
+                previous_frame = latest
+                if fresh_frame:
+                    _, frame = latest
+                    frame_host[0].copy_(frame)
+                    frame_gpu.copy_(frame_host, non_blocking=True)
                 video_frame = frame_gpu
                 last_video = now
             _update_timing(
@@ -1196,19 +1314,38 @@ def run_main() -> None:
             axes_host.copy_(axes, non_blocking=True)
             torch.cuda.synchronize(device)
             axis_values = axes_host[0].float()
+            nonfinite = _nonfinite_control_outputs(axes, movement, buttons)
+            if nonfinite:
+                raise FloatingPointError(
+                    f"TensorRT produced non-finite {', '.join(nonfinite)} "
+                    f"at tick {tick}; no control output was applied"
+                )
+            discrete: tuple[int, int] | None = None
+            button_states: tuple[bool, ...] | None = None
+            movement_state: torch.Tensor | None = None
+            button_state: torch.Tensor | None = None
+            if movement is not None and buttons is not None:
+                movement_state = movement.argmax(dim=-1)
+                button_state = buttons >= 0
+                discrete = (
+                    int(movement_state[0, 0]),
+                    int(movement_state[0, 1]),
+                )
+                button_states = tuple(
+                    bool(value) for value in button_state[0].tolist()
+                )
             delta = denormalizer.convert(axis_values, 1.0 / cfg.fast_hz)
             backend.apply_relative_mouse(*delta)  # type: ignore[attr-defined]
             metadata["executed_axes"].copy_(axes)
-            if movement is not None and buttons is not None:
-                discrete = tuple(
-                    int(value) for value in movement.argmax(dim=-1)[0].tolist()
-                )
-                button_states = tuple(
-                    bool(value) for value in (buttons[0] >= 0).tolist()
-                )
+            if (
+                discrete is not None
+                and button_states is not None
+                and movement_state is not None
+                and button_state is not None
+            ):
                 backend.apply_discrete(discrete, button_states)  # type: ignore[attr-defined]
-                metadata["movement"].copy_(movement.argmax(dim=-1))
-                metadata["buttons"].copy_(buttons >= 0)
+                metadata["movement"].copy_(movement_state)
+                metadata["buttons"].copy_(button_state)
                 last_slow = now
             tick += 1
     finally:

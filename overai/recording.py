@@ -190,6 +190,8 @@ class AxisDenormalizer:
     def convert(self, axes: torch.Tensor, duration_seconds: float) -> tuple[int, int]:
         if tuple(axes.shape) != (2,):
             raise ValueError("axes must have shape [2]")
+        if not torch.isfinite(axes).all():
+            raise ValueError("axes must be finite")
         result: list[int] = []
         for index in range(2):
             value = (

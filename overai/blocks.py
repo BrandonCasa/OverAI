@@ -68,10 +68,14 @@ class FourierTimeEmbedding(nn.Module):
         self.projection = MLP(encoded_dim, model_dim, model_dim, dropout=dropout)
 
     def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
-        frequencies = self.frequency_values.to(dtype=timestamps.dtype)
-        angles = timestamps.unsqueeze(-1) * frequencies
+        # FP16 overflows at only two seconds for the highest 2**15 frequency.
+        # Keep the periodic angle calculation in FP32, then return to the model
+        # dtype after sin/cos have bounded the values to [-1, 1].
+        angles = timestamps.float().unsqueeze(-1) * self.frequency_values.float()
         encoded = torch.cat((torch.sin(angles), torch.cos(angles)), dim=-1)
-        return self.projection(encoded.flatten(start_dim=-2))
+        return self.projection(
+            encoded.flatten(start_dim=-2).to(dtype=timestamps.dtype)
+        )
 
 
 class ExportableAttention(nn.Module):
