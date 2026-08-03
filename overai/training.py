@@ -206,6 +206,7 @@ def _run_tick(
     tick: int,
     state,
     device: torch.device,
+    frame: torch.Tensor | None = None,
 ):
     actions = batch.executed_actions(tick, device)
     timing = batch.timing_context(tick, device)
@@ -213,7 +214,7 @@ def _run_tick(
     if tick % model.cfg.fast_ticks_per_video == 0:
         frame_index = tick // model.cfg.fast_ticks_per_video
         output = model.on_video_frame(
-            batch.load_frame(frame_index, device),
+            batch.load_frame(frame_index, device) if frame is None else frame,
             actions,
             timing,
             state,
@@ -496,11 +497,11 @@ def save_checkpoint(
     data_loader_generator_state: torch.Tensor,
     best_validation_loss: float | None = None,
     validation_metrics: dict[str, float] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
+    payload: dict[str, Any] = {
             "format_version": 4,
             "model_config": model.cfg.to_dict(),
             "training_config": asdict(training_cfg),
@@ -517,9 +518,16 @@ def save_checkpoint(
             "global_step": global_step,
             "best_validation_loss": best_validation_loss,
             "validation_metrics": validation_metrics,
-        },
-        temporary,
-    )
+        }
+    if extra:
+        protected = payload.keys() & extra.keys()
+        if protected:
+            raise ValueError(
+                "extra checkpoint data cannot replace standard fields: "
+                + ", ".join(sorted(protected))
+            )
+        payload.update(extra)
+    torch.save(payload, temporary)
     temporary.replace(path)
 
 

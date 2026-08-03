@@ -3,7 +3,7 @@ name = "overai"
 version = "0.1.0"
 description = "Hierarchical supervised imitation controller for classic games"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "accelerate",
     "einops",
@@ -22,6 +22,7 @@ dependencies = [
 overai-benchmark = "overai.benchmark:main"
 overai-synthetic = "overai.synthetic:main"
 overai-train = "overai.training:main"
+overai-distill = "overai.distillation:main"
 overai-record = "overai.recording:record_main"
 overai-finalize-dataset = "overai.recording:finalize_main"
 overai-export-rtx = "overai.rtx:export_main"

@@ -39,8 +39,8 @@ uv run python -m unittest discover -v
 uv run overai-benchmark --model-config configs/rtx4080_720p.json
 ```
 
-RTX deployment needs Python 3.13 because the TensorRT-RTX wheel does not support
-Python 3.14. After installing CUDA Toolkit 13.2 or newer 13.x, Visual Studio C++ Build
+The checked-in `.python-version` pins Python 3.13 because the TensorRT-RTX wheel
+does not support Python 3.14. After installing CUDA Toolkit 13.2 or newer 13.x, Visual Studio C++ Build
 Tools, CMake/Ninja, TensorRT-RTX prerequisites, and Nsight Systems, provision the
 isolated environment with `scripts/setup-rtx4080.ps1`. The script locates those tools
 itself and refuses a non-RTX-4080 GPU.
@@ -149,16 +149,16 @@ training counts/second and are frozen for validation, training, and deployment.
 
 ## Local RTX 4080 training
 
-The RTX 4080 profile uses 720p input with 576 visual tokens, down from 1,296 at
-1080p. Its four 256-wide vision blocks and 6×8 windows keep the visual path local
-and efficient. The 320-wide shared/controller state retains capacity for temporal
-reasoning, while 12 shared queries correspond to the current 2-axis movement,
-8-button, and 2-axis continuous interface. Memory keeps the same roughly 30-second
-time span with 360 compressed tokens instead of 720, and the two-second output
-horizons use one decoder block. This reduces the model from 34.3M to 24.3M
-parameters while preserving the input channels, control targets, and horizons.
-The H100 profile uses the same learned architecture for checkpoint portability,
-but disables gradient checkpointing to favor throughput on the larger-memory GPU.
+The current RTX 4080 teacher profile uses 720p input with 576 visual tokens, six
+512-wide vision blocks, a 640-wide shared/controller state, three fusion blocks,
+two decoder blocks, and 121.0M parameters. The distillation target in
+`configs/rtx4080_720p_new.json` preserves the same input, memory schedule, control
+targets, rates, and two-second horizons while reducing the internals to four
+256-wide vision blocks, a 320-wide state, two fusion blocks, one decoder block,
+and 24.3M parameters. Its 6×8 windows keep visual attention local and its 12 shared
+queries correspond to the 2-axis movement, 8-button, and 2-axis continuous
+interface. The H100 profile matches the smaller learned architecture but disables
+gradient checkpointing to favor throughput on the larger-memory GPU.
 The Overwatch command uses
 5 seconds of causal warm-up while optimizing two seconds at a time so the
 current episode lengths contribute useful windows.
@@ -223,6 +223,69 @@ improves. Reported metrics include discrete accuracy/F1, axis Huber and derivati
 losses, and immediate-axis MAE. Held-out closed-loop gameplay scenarios remain a
 separate final quality gate: decreasing imitation loss alone does not prove the
 agent can recover from its own mistakes.
+
+## Distill the current RTX 4080 checkpoint
+
+Knowledge distillation trains a fresh, smaller student from the frozen outputs of
+the existing model while keeping the original demonstration targets as a 30% hard-
+label anchor. It does not overwrite or mutate the teacher checkpoint. The teacher
+and student may use different internal widths and layer counts, but their image,
+control, rate, and horizon contracts must match.
+
+The Apex helper defaults to
+`runs\apex-4080\checkpoint_last.pt` as the teacher and
+`configs\rtx4080_720p_new.json` as the student. First run its read-only readiness
+check; this validates both manifests, the format-4 checkpoint, frozen axis
+calibration, control profile, and teacher/student compatibility:
+
+```powershell
+.\scripts\distill-apex-rtx4080.ps1
+```
+
+Start the full distillation explicitly:
+
+```powershell
+.\scripts\distill-apex-rtx4080.ps1 -Distill
+```
+
+The equivalent direct command is:
+
+```powershell
+.venv\Scripts\overai-distill.exe `
+  --teacher-checkpoint runs\apex-4080\checkpoint_last.pt `
+  --student-config configs\rtx4080_720p_new.json `
+  --manifest C:\Users\brand\Documents\overai\Apex\train\train.json `
+  --validation-manifest C:\Users\brand\Documents\overai\Apex\validation\validation.json `
+  --output runs\apex-4080-distilled `
+  --batch-size 1 `
+  --epochs 10 `
+  --history-seconds 5 `
+  --optimization-seconds 2 `
+  --stride-seconds 2 `
+  --tbptt-seconds 0.1 `
+  --num-workers 2 `
+  --checkpoint-every-steps 120 `
+  --bf16
+```
+
+The student run writes `checkpoint_last.pt`, validation-selected
+`checkpoint_best.pt`, `metrics.jsonl`, and model/training/distillation config files
+under `runs\apex-4080-distilled`. Checkpoints embed the teacher SHA-256 and
+distillation settings. Resume an interrupted student run without changing those
+settings or the teacher:
+
+```powershell
+.\scripts\distill-apex-rtx4080.ps1 -Distill `
+  -Resume runs\apex-4080-distilled\checkpoint_last.pt
+```
+
+Use `-TeacherCheckpoint` to select `checkpoint_best.pt` or another run explicitly.
+`-CompileVision` compiles only the student vision path and must be supplied again
+when resuming. Distillation still needs the original train and held-out validation
+episodes because the teacher supplies soft targets on those recorded states; the
+validation metrics remain label-based. Export and benchmark
+`runs\apex-4080-distilled\checkpoint_best.pt` through the normal RTX workflow
+before treating the smaller model as a replacement.
 
 ## RTX 4080 deployment
 

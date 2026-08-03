@@ -3,13 +3,18 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from typing import Any, cast
+from unittest.mock import patch
 
 import torch
 
 from overai.benchmark import _scheduled_paths
 from overai.config import ModelConfig
-from overai.rtx import METADATA_INPUT_NAMES, Rtx4080Controller, _update_timing
-
+from overai.rtx import (
+    METADATA_INPUT_NAMES,
+    Rtx4080Controller,
+    _update_timing,
+    validate_engine_builder,
+)
 
 _STATE_KEYS = (
     "recent",
@@ -86,6 +91,22 @@ def _metadata() -> dict[str, torch.Tensor]:
 
 
 class RtxSchedulingTests(unittest.TestCase):
+    def test_engine_builder_validation_fails_before_export_without_sdk(self) -> None:
+        with (
+            patch("overai.rtx.sys.version_info", (3, 13)),
+            patch("overai.rtx._rtx_executable", return_value=None),
+            patch("overai.rtx._tensorrt_rtx", side_effect=ImportError),
+            self.assertRaisesRegex(RuntimeError, "setup-rtx4080.ps1"),
+        ):
+            validate_engine_builder()
+
+    def test_engine_builder_validation_rejects_python_314(self) -> None:
+        with (
+            patch("overai.rtx.sys.version_info", (3, 14)),
+            self.assertRaisesRegex(RuntimeError, "Python 3.14"),
+        ):
+            validate_engine_builder()
+
     def test_graph_metadata_has_no_hud_inputs(self) -> None:
         self.assertEqual(
             METADATA_INPUT_NAMES,
@@ -100,7 +121,9 @@ class RtxSchedulingTests(unittest.TestCase):
             ],
         )
 
-    def test_memory_and_discrete_schedules_use_independent_configured_phases(self) -> None:
+    def test_memory_and_discrete_schedules_use_independent_configured_phases(
+        self,
+    ) -> None:
         cfg = ModelConfig.tiny()
         controller, calls = _fake_controller(cfg)
         frame = torch.zeros(1)
@@ -145,9 +168,7 @@ class RtxSchedulingTests(unittest.TestCase):
             _scheduled_paths(ModelConfig.tiny()),
             {"video+slow", "video", "fast"},
         )
-        frame_free_slow = replace(
-            ModelConfig.tiny(), video_hz=1, slow_hz=2, fast_hz=4
-        )
+        frame_free_slow = replace(ModelConfig.tiny(), video_hz=1, slow_hz=2, fast_hz=4)
         self.assertEqual(
             _scheduled_paths(frame_free_slow),
             {"video+slow", "fast", "fast+slow"},

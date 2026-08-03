@@ -116,6 +116,7 @@ class _LateStaleFrameBackend(_SyntheticBackend):
         if self.capture_calls == 4:
             self.frame_timeouts.append(timeout_ms)
             self.capture_calls += 1
+            assert self.stale_timestamp is not None
             return (
                 self.stale_timestamp,
                 torch.ones(

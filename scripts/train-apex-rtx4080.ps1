@@ -49,7 +49,7 @@ try {
         "--validation-manifest", $validationManifest,
         "--model-config", $modelConfig,
         "--output", $output,
-        "--batch-size", "4",
+        "--batch-size", "2",
         "--epochs", "$Epochs",
         "--history-seconds", "5",
         "--optimization-seconds", "2",

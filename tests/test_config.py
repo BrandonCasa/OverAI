@@ -22,17 +22,37 @@ class ModelConfigTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         self.assertEqual(
             cfg,
-            ModelConfig.from_json(root / "configs" / "rtx4080_720p.json"),
+            ModelConfig.from_json(root / "configs" / "rtx4080_720p_new.json"),
         )
 
-    def test_hardware_profiles_share_learned_architecture(self) -> None:
+    def test_distillation_target_matches_original_hardware_profile(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        rtx = ModelConfig.from_json(root / "configs" / "rtx4080_720p.json")
+        student = ModelConfig.from_json(root / "configs" / "rtx4080_720p_new.json")
         h100 = ModelConfig.from_json(root / "configs" / "h100_720p.json")
         self.assertEqual(
-            replace(rtx, gradient_checkpointing=False),
+            replace(student, gradient_checkpointing=False),
             h100,
         )
+
+    def test_teacher_profile_is_larger_but_io_compatible(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        teacher = ModelConfig.from_json(root / "configs" / "rtx4080_720p.json")
+        student = ModelConfig.from_json(root / "configs" / "rtx4080_720p_new.json")
+        self.assertGreater(teacher.model_dim, student.model_dim)
+        self.assertGreater(teacher.vision_layers, student.vision_layers)
+        for field in (
+            "image_height",
+            "image_width",
+            "input_channels",
+            "channel_order",
+            "video_hz",
+            "slow_hz",
+            "fast_hz",
+            "slow_horizon",
+            "fast_horizon",
+            "num_buttons",
+        ):
+            self.assertEqual(getattr(teacher, field), getattr(student, field))
 
     def test_rejects_inefficient_window_larger_than_grid(self) -> None:
         with self.assertRaisesRegex(ValueError, "attention windows"):

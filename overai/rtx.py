@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import importlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -38,8 +40,14 @@ RTX_COMPUTE_CAPABILITY = (8, 9)
 ARTIFACT_VERSION = 3
 
 
+def _tensorrt_rtx() -> Any:
+    """Load dynamic SDK bindings without relying on their incomplete stubs."""
+
+    return importlib.import_module("tensorrt_rtx")
+
+
 def _torch_dtype(trt_dtype: Any) -> torch.dtype:
-    import tensorrt_rtx as trt  # type: ignore[import-not-found]
+    trt = _tensorrt_rtx()
 
     mapping = {
         trt.DataType.FLOAT: torch.float32,
@@ -60,7 +68,7 @@ class TensorRtxEngine:
     """Persistent-buffer TensorRT-RTX engine with whole-graph CUDA capture."""
 
     def __init__(self, engine_path: Path, device: torch.device) -> None:
-        import tensorrt_rtx as trt  # type: ignore[import-not-found]
+        trt = _tensorrt_rtx()
 
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
@@ -704,9 +712,26 @@ def _rtx_executable() -> str | None:
     return executable
 
 
+def validate_engine_builder() -> None:
+    if sys.version_info >= (3, 14):
+        raise RuntimeError(
+            "TensorRT-RTX does not support Python 3.14; run "
+            "scripts/setup-rtx4080.ps1 to provision the pinned Python 3.13 environment"
+        )
+    if _rtx_executable() is not None:
+        return
+    try:
+        _tensorrt_rtx()
+    except ImportError as error:
+        raise RuntimeError(
+            "TensorRT-RTX SDK CLI or Python package is unavailable; run "
+            "scripts/setup-rtx4080.ps1 before exporting engines"
+        ) from error
+
+
 def _build_engine_python(onnx_path: Path, engine_path: Path) -> str:
     try:
-        import tensorrt_rtx as trt  # type: ignore[import-not-found]
+        trt = _tensorrt_rtx()
     except ImportError as error:
         raise RuntimeError(
             "TensorRT-RTX SDK CLI or Python package is required to build engines"
@@ -753,7 +778,7 @@ def build_engines(artifact_dir: Path) -> None:
             )
         graph["engine"] = engine_path.name
     try:
-        import tensorrt_rtx as trt_rtx  # type: ignore[import-not-found]
+        trt_rtx = _tensorrt_rtx()
 
         manifest["tensorrt_rtx_version"] = trt_rtx.__version__
     except (ImportError, AttributeError):
@@ -909,6 +934,9 @@ def export_main() -> None:
     parser.add_argument("--fp32-attention", action="store_true")
     parser.add_argument("--fp32-layernorm", action="store_true")
     args = parser.parse_args()
+    if not args.skip_engine_build:
+        validate_rtx4080()
+        validate_engine_builder()
     manifest = export_rtx_artifact(
         args.checkpoint,
         args.output,
@@ -916,7 +944,6 @@ def export_main() -> None:
         fp32_layernorm=args.fp32_layernorm,
     )
     if not args.skip_engine_build:
-        validate_rtx4080()
         build_engines(args.output)
     print(manifest)
 

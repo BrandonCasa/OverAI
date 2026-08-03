@@ -31,6 +31,10 @@ class RawInputStartupTests(unittest.TestCase):
             torch.zeros(360, 640, 4, dtype=torch.uint8)
         )
 
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None
+        assert second is not None
         self.assertEqual(tuple(first.shape), (2, 72, 128))
         self.assertEqual(tuple(second.shape), (2, 72, 128))
         self.assertEqual(backend._source_size, (360, 640))
